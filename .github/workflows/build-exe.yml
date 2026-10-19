@@ -1,0 +1,31 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+    paths: ['jczq_app.py', 'jczq.py', '.github/workflows/build-exe.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build EXE with PyInstaller
+        run: |
+          pip install pyinstaller
+          pyinstaller --noconfirm --onefile --windowed --name 竞彩足球分析工具 `
+            --distpath dist --workpath build jczq_app.py
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 竞彩足球分析工具-exe
+          path: dist/*.exe
+          retention-days: 90
