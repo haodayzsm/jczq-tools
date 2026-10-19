@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "v1.0"
+APP_VERSION = "v1.1"
 
 # 数据目录：exe/script 同目录（打包后也可移植）
 if getattr(sys, "frozen", False):          # PyInstaller 打包后
@@ -37,6 +37,7 @@ HIST_FILE = DATA_DIR / "history.json"
 HIST_CSV = DATA_DIR / "history.csv"
 ONSALE_FILE = DATA_DIR / "onsale.json"
 ONSALE_CSV = DATA_DIR / "onsale.csv"
+FETCH_LOG_FILE = DATA_DIR / "fetch_log.json"   # 抓取记录：哪些日期已落盘，防重复抓
 
 BASE = "https://webapi.sporttery.cn"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -195,18 +196,72 @@ def daterange_windows(begin, end, days=7):
         cur = we + timedelta(days=1)
 
 
+# ── 抓取记录（fetch_log）：已完整落盘的「过去窗口」不再重复抓 ──
+
+def _load_fetch_log():
+    if FETCH_LOG_FILE.exists():
+        try:
+            return json.loads(FETCH_LOG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"windows": []}
+
+
+def _save_fetch_log(log):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # 压缩合并相邻窗口，控制文件体积
+    ws = sorted(set(tuple(w) for w in log.get("windows", [])))
+    merged = []
+    for b, e in ws:
+        if merged and b <= _next_day(merged[-1][1]):
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([b, e])
+    FETCH_LOG_FILE.write_text(json.dumps({"windows": merged}, ensure_ascii=False, indent=1),
+                              encoding="utf-8")
+
+
+def _next_day(d):
+    return (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _is_past_window(end_str):
+    """窗口结束日早于今天 → 该窗口赛果已定格，抓一次就够（未完赛场次由 match_id 去重兜底）"""
+    return end_str < datetime.now().strftime("%Y-%m-%d")
+
+
+def _window_covered(log, wb, we):
+    """窗口是否已被记录覆盖"""
+    for b, e in log.get("windows", []):
+        if b <= wb and we <= e:
+            return True
+    return False
+
+
 def do_fetch_history(begin, end, progress_cb=None):
+    """增量抓取：过去且已记录的窗口直接跳过，只抓新增部分。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log = _load_fetch_log()
     raw_all = []
     windows = list(daterange_windows(begin, end))
+    skipped = 0
     for i, (wb, we) in enumerate(windows, 1):
+        if _is_past_window(we) and _window_covered(log, wb, we):
+            skipped += 1
+            if progress_cb:
+                progress_cb(i, len(windows), wb, we, -1)   # -1 = 跳过
+            continue
         raw = fetch_history_window(wb, we)
         raw_all.extend(raw)
+        # 只有「过去窗口」才记录为已完成（今天/未来的场次后续会出赛果，要允许重抓）
+        if _is_past_window(we):
+            log.setdefault("windows", []).append([wb, we])
         if progress_cb:
             progress_cb(i, len(windows), wb, we, len(raw))
+    _save_fetch_log(log)
     rows = [map_match(m, now, has_odds=False) for m in raw_all]
     merged, added = merge_history(rows)
-    return merged, added, len(rows)
+    return merged, added, len(rows), skipped
 
 
 # ══════════════════════ 统计引擎 ══════════════════════
@@ -424,6 +479,35 @@ class App(tk.Tk):
         bar = ttk.Frame(info)
         bar.pack(fill="x", padx=6, pady=4)
         ttk.Button(bar, text="打开数据目录", command=self._open_datadir).pack(side="left")
+        ttk.Button(bar, text="备份数据", command=self._backup_data).pack(side="left", padx=8)
+        ttk.Button(bar, text="重置抓取记录(强制重抓)", command=self._reset_fetchlog).pack(side="left")
+
+    def _backup_data(self):
+        """把 data/ 打包成 zip 备份到用户选的位置"""
+        import zipfile
+        if not DATA_DIR.exists():
+            messagebox.showinfo("提示", "还没有数据可备份")
+            return
+        f = filedialog.asksaveasfilename(
+            defaultextension=".zip",
+            initialfile=f"竞彩数据备份_{datetime.now():%Y%m%d_%H%M}.zip",
+            filetypes=[("ZIP", "*.zip")])
+        if not f:
+            return
+        with zipfile.ZipFile(f, "w", zipfile.ZIP_DEFLATED) as z:
+            for p in DATA_DIR.iterdir():
+                if p.is_file():
+                    z.write(p, p.name)
+        messagebox.showinfo("完成", f"已备份到:\n{f}")
+
+    def _reset_fetchlog(self):
+        if not FETCH_LOG_FILE.exists():
+            messagebox.showinfo("提示", "抓取记录本来就是空的")
+            return
+        if messagebox.askyesno("确认", "重置后，下次更新会重新抓取所有窗口（数据本身不会丢，只影响去重判断）。确定？"):
+            FETCH_LOG_FILE.unlink()
+            self._show_lib_info()
+            messagebox.showinfo("完成", "抓取记录已重置")
 
     def _quick_range(self, days):
         self.e_hb.delete(0, "end")
@@ -456,13 +540,19 @@ class App(tk.Tk):
                 elif kind == "hist_progress":
                     i, n, wb, we, cnt = payload
                     self.pbar["value"] = i / n * 100
-                    self.lbl_progress.config(text=f"进度 {i}/{n} 窗口（{wb}~{we} 抓到 {cnt} 场）")
+                    if cnt == -1:
+                        self.lbl_progress.config(text=f"进度 {i}/{n} 窗口（{wb}~{we} 已有数据，跳过）")
+                    else:
+                        self.lbl_progress.config(text=f"进度 {i}/{n} 窗口（{wb}~{we} 抓到 {cnt} 场）")
                 elif kind == "hist_done":
-                    merged, added, fetched = payload
+                    merged, added, fetched, skipped = payload
                     self._show_lib_info()
-                    self.lbl_progress.config(text=f"完成：本轮抓取 {fetched} 场，新增 {added} 场，库中共 {len(merged)} 场")
+                    self.lbl_progress.config(
+                        text=f"完成：本轮抓取 {fetched} 场，新增 {added} 场，跳过 {skipped} 个已有窗口，库中共 {len(merged)} 场")
                     self.status.set("历史数据更新完成")
-                    messagebox.showinfo("完成", f"更新完成！\n本轮抓取 {fetched} 场\n新增 {added} 场\n本地库共 {len(merged)} 场")
+                    messagebox.showinfo("完成",
+                                        f"更新完成！\n本轮抓取 {fetched} 场\n新增 {added} 场\n"
+                                        f"跳过 {skipped} 个已保存的窗口\n本地库共 {len(merged)} 场")
                 elif kind == "local_loaded":
                     self._fill_onsale(payload[0], from_cache=True)
                     self._show_lib_info(payload[1])
@@ -589,16 +679,16 @@ class App(tk.Tk):
         self._bg(lambda: self._task_hist(hb, he))
 
     def _task_hist(self, hb, he):
-        merged, added, fetched = do_fetch_history(hb, he,
+        merged, added, fetched, skipped = do_fetch_history(hb, he,
             progress_cb=lambda i, n, wb, we, cnt: self.msgq.put(
                 ("hist_progress", (i, n, wb, we, cnt))))
-        self.msgq.put(("hist_done", (merged, added, fetched)))
+        self.msgq.put(("hist_done", (merged, added, fetched, skipped)))
 
     def _show_lib_info(self, hist=None):
         hist = hist if hist is not None else load_history()
+        self.txt_info.config(state="normal")
+        self.txt_info.delete("1.0", "end")
         if not hist:
-            self.txt_info.config(state="normal")
-            self.txt_info.delete("1.0", "end")
             self.txt_info.insert("end", "本地暂无历史数据，请先更新。")
             self.txt_info.config(state="disabled")
             return
@@ -606,13 +696,17 @@ class App(tk.Tk):
         from collections import Counter
         lg = Counter(r["league"] for r in hist).most_common(8)
         done = sum(1 for r in hist if r["result"] in ("H", "D", "A"))
-        self.txt_info.config(state="normal")
-        self.txt_info.delete("1.0", "end")
+        log = _load_fetch_log()
+        cov = "、".join(f"{b}~{e}" for b, e in log.get("windows", [])[:6])
+        if len(log.get("windows", [])) > 6:
+            cov += " …"
         self.txt_info.insert("end",
             f"库中共 {len(hist)} 场（完赛 {done} 场）\n"
             f"日期覆盖: {dates[0]} ~ {dates[-1]}\n"
+            f"已保存区间(更新时自动跳过): {cov or '无'}\n"
             f"场次最多的联赛: " + "、".join(f"{k}({v})" for k, v in lg) + "\n"
-            f"文件位置: {DATA_DIR}")
+            f"文件位置: {DATA_DIR}\n"
+            f"文件: history.json / history.csv（长期保存，随更新增量追加）")
         self.txt_info.config(state="disabled")
 
     def _open_datadir(self):

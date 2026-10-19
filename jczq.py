@@ -180,6 +180,41 @@ def cmd_current():
 
 
 # ── 命令：历史 ───────────────────────────────────────
+FETCH_LOG_FILE = DATA_DIR / "fetch_log.json"   # 抓取记录：已落盘日期区间
+
+
+def _load_fetch_log():
+    if FETCH_LOG_FILE.exists():
+        try:
+            return json.loads(FETCH_LOG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"windows": []}
+
+
+def _save_fetch_log(log):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # 合并相邻/重叠窗口，控制文件体积
+    ws = sorted(set(tuple(w) for w in log.get("windows", [])))
+    merged = []
+    for b, e in ws:
+        nb = (datetime.strptime(merged[-1][1], "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d") if merged else None
+        if merged and b <= nb:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([b, e])
+    FETCH_LOG_FILE.write_text(json.dumps({"windows": merged}, ensure_ascii=False, indent=1),
+                              encoding="utf-8")
+
+
+def _window_covered(log, wb, we):
+    """窗口是否已被已抓取区间覆盖"""
+    for b, e in log.get("windows", []):
+        if b <= wb and we <= e:
+            return True
+    return False
+
+
 def daterange(begin, end):
     """按 7 天一窗切分日期区间（官方翻页对大区间不友好，切窗最稳）"""
     b = datetime.strptime(begin, "%Y-%m-%d")
@@ -224,15 +259,26 @@ def cmd_history(begin, end):
     print("=" * 60)
     print(f"  [历史抓取] {begin} ~ {end}")
     print("=" * 60)
+    log = _load_fetch_log()
+    today = datetime.now().strftime("%Y-%m-%d")
     raw_all = []
+    skipped = 0
     for wb, we in daterange(begin, end):
+        # 过去且已完整落盘的窗口：直接跳过，不重复请求
+        if we < today and _window_covered(log, wb, we):
+            skipped += 1
+            print(f"  窗口 {wb}~{we}: 已有数据，跳过")
+            continue
         raw = fetch_history_window(wb, we)
         done = sum(1 for m in raw if m.get("winFlag") in ("H", "D", "A"))
         print(f"  窗口 {wb}~{we}: {len(raw)} 场（完赛 {done}）")
         raw_all.extend(raw)
+        if we < today:  # 只有过去的窗口才记录为已完成
+            log.setdefault("windows", []).append([wb, we])
+    _save_fetch_log(log)
     rows = [map_match(m, now, has_odds=False) for m in raw_all]
     total, added = merge_history(rows)
-    print(f"  本轮抓到 {len(rows)} 场，新增 {added} 场，历史库共 {total} 场 → history.json / history.csv")
+    print(f"  本轮抓到 {len(rows)} 场，新增 {added} 场，跳过 {skipped} 个已存窗口，历史库共 {total} 场 → history.json / history.csv")
     print(f"HISTORY_OK:{total}(+{added})")
     return rows
 
