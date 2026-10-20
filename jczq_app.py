@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "v1.3"
+APP_VERSION = "v1.3.1"
 
 # 数据目录：exe/script 同目录（打包后也可移植）
 if getattr(sys, "frozen", False):          # PyInstaller 打包后
@@ -416,7 +416,7 @@ def stat_normal(target, pct, side="win", league="", date_from="", date_to=""):
 
 
 def stat_all_odds(target, pct, league="", date_from="", date_to=""):
-    """全部方向：胜/平/负赔率都要落在 target±pct% 内"""
+    """全部方向：胜/平/负任意一项落在 target±pct% 内即命中"""
     lo, hi = target * (1 - pct / 100), target * (1 + pct / 100)
     hist = load_history()
     out = []
@@ -424,9 +424,10 @@ def stat_all_odds(target, pct, league="", date_from="", date_to=""):
         if not _base_filters(r, league, date_from, date_to):
             continue
         vals = [r.get(k, "") for k in ("odds_win", "odds_draw", "odds_lose")]
-        if any(v == "" for v in vals):
+        nums = [float(v) for v in vals if v != ""]
+        if not nums:
             continue
-        if all(lo <= float(v) <= hi for v in vals):
+        if any(lo <= v <= hi for v in nums):
             out.append(r)
     st = _dist_stats(out, "win")
     st["range"] = (round(lo, 2), round(hi, 2))
@@ -492,9 +493,15 @@ def list_teams():
     return sorted(teams)
 
 
-def stat_team_matches(home, away, date_from="", date_to=""):
-    """球队统计：两支球队的历史交锋+各自比赛（含交手标记）"""
+def stat_team_matches(team_a, team_b, date_from="", date_to=""):
+    """
+    球队统计（不分主客）：
+    - 两队都填：查这两队的交锋（主客互换都算）+ 各自其他比赛
+    - 只填一队：查该队全部比赛
+    """
     hist = load_history()
+    a = (team_a or "").strip()
+    b = (team_b or "").strip()
     out = []
     for r in hist:
         md = r.get("match_date") or ""
@@ -502,28 +509,37 @@ def stat_team_matches(home, away, date_from="", date_to=""):
             continue
         if date_to and md > date_to:
             continue
-        h, a = r.get("home") or "", r.get("away") or ""
-        if h == home and a == away:
-            r2 = dict(r); r2["h2h"] = "交锋"
-            out.append(r2)
-        elif h == away and a == home:
-            r2 = dict(r); r2["h2h"] = "交锋(主客互换)"
-            out.append(r2)
-        elif home in (h, a) or away in (h, a):
-            r2 = dict(r); r2["h2h"] = "相关"
-            out.append(r2)
+        h, aw = r.get("home") or "", r.get("away") or ""
+        if a and b:
+            if {h, aw} == {a, b}:
+                r2 = dict(r)
+                r2["h2h"] = "交锋"
+                out.append(r2)
+            elif a in (h, aw) or b in (h, aw):
+                r2 = dict(r)
+                r2["h2h"] = "相关"
+                out.append(r2)
+        elif a:  # 单队模式
+            if a in (h, aw):
+                r2 = dict(r)
+                r2["h2h"] = "该队比赛"
+                out.append(r2)
     out.sort(key=lambda r: r.get("match_date") or "", reverse=True)
-    # 交锋战绩
-    h2h = [r for r in out if r["h2h"].startswith("交锋")]
+    # 交锋战绩（从 team_a 视角，主客互换时翻转赛果）
+    h2h = [r for r in out if r["h2h"] == "交锋"]
     def _perspective(r):
-        # 从 home 队视角：对手是 away 时
-        h, a = r.get("home"), r.get("away")
-        if h == home:
-            return r["result"]            # H=胜 D=平 A=负（home视角）
+        if r.get("home") == a:
+            return r["result"]
         return {"H": "A", "D": "D", "A": "H"}.get(r["result"], r["result"])
     w = sum(1 for r in h2h if _perspective(r) == "H")
     d = sum(1 for r in h2h if _perspective(r) == "D")
     l = sum(1 for r in h2h if _perspective(r) == "A")
+    # 单队模式：统计该队整体战绩
+    if not b:
+        h2h = out
+        w = sum(1 for r in out if _perspective(r) == "H")
+        d = sum(1 for r in out if _perspective(r) == "D")
+        l = sum(1 for r in out if _perspective(r) == "A")
     n = len(h2h)
     st = {
         "n": len(out), "n_h2h": n,
@@ -532,6 +548,7 @@ def stat_team_matches(home, away, date_from="", date_to=""):
         "p_draw": d / n * 100 if n else 0,
         "p_lose": l / n * 100 if n else 0,
         "roi": 0,
+        "single_team": not b,
     }
     return out, st
 
@@ -741,11 +758,12 @@ class App(tk.Tk):
     def _on_team_typing(self, event=None):
         ent = event.widget
         txt = ent.get().strip()
+        self._team_entry_active = ent        # 记住当前正在输入的框
         if not txt:
             self.lb_teams.place_forget()
             return
         if not self._teams_cache:
-            self._bg(self._load_teams)
+            self._teams_cache = list_teams()   # 首次同步加载（本地SQLite, 毫秒级）
         hits = [t for t in self._teams_cache if txt in t][:12]
         if hits:
             self.lb_teams.delete(0, "end")
@@ -767,14 +785,14 @@ class App(tk.Tk):
         if not sel:
             return
         team = self.lb_teams.get(sel[0])
-        # 判断是哪个输入框触发的（焦点在谁身上就填谁）
-        focus = self.focus_get()
-        if focus is self.e_team_h:
-            self.e_team_h.delete(0, "end"); self.e_team_h.insert(0, team)
-        elif focus is self.e_team_a:
-            self.e_team_a.delete(0, "end"); self.e_team_a.insert(0, team)
+        # 填到「触发补全的那个输入框」，而不是看当前焦点
+        ent = getattr(self, "_team_entry_active", None) or self.e_team_h
+        ent.delete(0, "end")
+        ent.insert(0, team)
         self.lb_teams.place_forget()
-        self.e_team_a.focus_set() if focus is self.e_team_h else self.e_team_h.focus_set()
+        # 焦点挪到另一个框，方便连续输入
+        other = self.e_team_a if ent is self.e_team_h else self.e_team_h
+        other.focus_set()
 
     # ── 数据管理页 ──
     def _build_data(self, tab):
@@ -965,8 +983,8 @@ class App(tk.Tk):
         elif mode == "team":
             home = self.e_team_h.get().strip()
             away = self.e_team_a.get().strip()
-            if not home or not away:
-                messagebox.showwarning("输入有误", "主队和客队都要填")
+            if not home and not away:
+                messagebox.showwarning("输入有误", "至少填一个球队（只填主队=查该队全部比赛）")
                 return
             self._bg(lambda: self._task_team(home, away, df, dt))
 
@@ -1011,12 +1029,20 @@ class App(tk.Tk):
                 f"提示: 排名越靠前，赔率结构与输入越接近")
         elif mode == "team":
             home, away = args
-            self.lbl_stat.insert("end",
-                f"查询条件：{home} vs {away}\n"
-                f"共找到 {stats['n']} 场相关比赛，其中正面交锋 {stats['n_h2h']} 场\n"
-                f"交锋战绩（{home} 视角）：胜 {stats['win']} 场({stats['p_win']:.1f}%)   "
-                f"平 {stats['draw']} 场({stats['p_draw']:.1f}%)   负 {stats['lose']} 场({stats['p_lose']:.1f}%)\n"
-                f"明细含两队各自的其他比赛（标记「相关」），按日期倒序")
+            if stats.get("single_team"):
+                self.lbl_stat.insert("end",
+                    f"查询条件：{home}\n"
+                    f"共找到 {stats['n']} 场比赛\n"
+                    f"整体战绩（{home} 视角，主客都算）：胜 {stats['win']} 场({stats['p_win']:.1f}%)   "
+                    f"平 {stats['draw']} 场({stats['p_draw']:.1f}%)   负 {stats['lose']} 场({stats['p_lose']:.1f}%)\n"
+                    f"按日期倒序，明细中「该队比赛」= 该队参与的场次")
+            else:
+                self.lbl_stat.insert("end",
+                    f"查询条件：{home} / {away}（不分主客）\n"
+                    f"共找到 {stats['n']} 场相关比赛，其中正面交锋 {stats['n_h2h']} 场\n"
+                    f"交锋战绩（{home} 视角）：胜 {stats['win']} 场({stats['p_win']:.1f}%)   "
+                    f"平 {stats['draw']} 场({stats['p_draw']:.1f}%)   负 {stats['lose']} 场({stats['p_lose']:.1f}%)\n"
+                    f"明细含两队各自的其他比赛（标记「相关」），按日期倒序")
         self.lbl_stat.config(state="disabled")
         self.tv_stat.delete(*self.tv_stat.get_children())
         for r in rows:
