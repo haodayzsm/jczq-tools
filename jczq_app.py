@@ -17,6 +17,7 @@ import json
 import csv
 import time
 import queue
+import sqlite3
 import threading
 import urllib.request
 import urllib.parse
@@ -25,7 +26,7 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "v1.1"
+APP_VERSION = "v1.2"
 
 # 数据目录：exe/script 同目录（打包后也可移植）
 if getattr(sys, "frozen", False):          # PyInstaller 打包后
@@ -33,11 +34,9 @@ if getattr(sys, "frozen", False):          # PyInstaller 打包后
 else:
     APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
-HIST_FILE = DATA_DIR / "history.json"
-HIST_CSV = DATA_DIR / "history.csv"
-ONSALE_FILE = DATA_DIR / "onsale.json"
-ONSALE_CSV = DATA_DIR / "onsale.csv"
-FETCH_LOG_FILE = DATA_DIR / "fetch_log.json"   # 抓取记录：哪些日期已落盘，防重复抓
+DB_FILE = DATA_DIR / "jczq.db"              # 内置 SQLite 数据库：全部数据都在这一个文件
+HIST_FILE = DATA_DIR / "history.json"       # 旧版 JSON（仅用于自动迁移）
+FETCH_LOG_FILE = DATA_DIR / "fetch_log.json"  # 旧版抓取记录（仅用于自动迁移）
 
 BASE = "https://webapi.sporttery.cn"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -118,33 +117,167 @@ def map_match(m, fetched_at, has_odds=True):
     }
 
 
+# ── SQLite 数据库层 ──────────────────────────────────
+
+DB_LOCK = threading.Lock()   # 多线程 GUI 下保护写操作
+
+
+def db():
+    """获取数据库连接（WAL 模式：并发读写不互塞，断电不烂库）"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_FILE, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def db_init():
+    """建表 + 索引 + 旧数据自动迁移（幂等，可反复调用）"""
+    with DB_LOCK, db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS matches (
+            match_id     TEXT PRIMARY KEY,
+            week         TEXT, match_num TEXT,
+            league       TEXT, home TEXT, away TEXT,
+            match_date   TEXT, match_time TEXT,
+            odds_win     REAL, odds_draw REAL, odds_lose REAL,
+            goal_line    REAL,
+            hhad_win     REAL, hhad_draw REAL, hhad_lose REAL,
+            single       TEXT, score TEXT, half_score TEXT,
+            result       TEXT, fetched_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_matches_date   ON matches(match_date);
+        CREATE INDEX IF NOT EXISTS idx_matches_odds   ON matches(odds_win, odds_draw, odds_lose);
+        CREATE INDEX IF NOT EXISTS idx_matches_result ON matches(result);
+        CREATE INDEX IF NOT EXISTS idx_matches_league ON matches(league);
+        CREATE TABLE IF NOT EXISTS fetch_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            win_begin TEXT NOT NULL, win_end TEXT NOT NULL,
+            UNIQUE(win_begin, win_end)
+        );
+        CREATE TABLE IF NOT EXISTS onsale (
+            match_id TEXT PRIMARY KEY, payload TEXT, fetched_at TEXT
+        );
+        """)
+        # ── 旧版 JSON 自动迁移（一次性）──
+        if HIST_FILE.exists():
+            try:
+                old = json.loads(HIST_FILE.read_text(encoding="utf-8"))
+                if old:
+                    n = upsert_matches(conn, old)
+                    if n >= 0:
+                        HIST_FILE.rename(HIST_FILE.with_suffix(".json.migrated"))
+                        print(f"[迁移] history.json → 数据库: {len(old)} 条已并入")
+            except Exception as e:
+                print(f"[迁移] history.json 失败(保留原文件): {e}")
+        if FETCH_LOG_FILE.exists():
+            try:
+                log = json.loads(FETCH_LOG_FILE.read_text(encoding="utf-8"))
+                for b, e in log.get("windows", []):
+                    conn.execute("INSERT OR IGNORE INTO fetch_log(win_begin, win_end) VALUES(?,?)", (b, e))
+                FETCH_LOG_FILE.rename(FETCH_LOG_FILE.with_suffix(".json.migrated"))
+                print("[迁移] fetch_log.json → 数据库")
+            except Exception as e:
+                print(f"[迁移] fetch_log.json 失败(保留原文件): {e}")
+
+
+def _row_dict(r):
+    return {k: ("" if r[k] is None else r[k]) for k in r.keys()} if not isinstance(r, dict) else r
+
+
+def upsert_matches(conn, rows):
+    """UPSERT：按 match_id 插入；已存在且有新赛果才更新。返回新增条数"""
+    added = 0
+    upd_cols = [k for k in CSV_FIELDS if k != "match_id"]
+    for r in rows:
+        if not r.get("match_id"):
+            continue
+        vals = [r.get(k, "") for k in CSV_FIELDS]
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO matches (" + ",".join(CSV_FIELDS) + ") VALUES(" +
+            ",".join("?" * len(CSV_FIELDS)) + ")", vals)
+        if cur.rowcount == 1:          # 真新增
+            added += 1
+            continue
+        # 已存在：仅当新数据带赛果（或库里还没比分）才更新，避免旧赛果被无赛果数据冲掉
+        conn.execute(
+            "UPDATE matches SET " + ",".join(f"{k}=?" for k in upd_cols) +
+            " WHERE match_id=? AND (? != '' OR ? != '' OR score = '')",
+            [r.get(k, "") for k in upd_cols] + [r["match_id"], r.get("score", ""), r.get("result", "")])
+    return added
+
+
 def load_history():
-    if HIST_FILE.exists():
-        try:
-            return json.loads(HIST_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-    return []
+    """读全部历史（dict 列表，兼容旧接口）"""
+    db_init()
+    with DB_LOCK, db() as conn:
+        rows = conn.execute("SELECT * FROM matches ORDER BY match_date, match_id").fetchall()
+    return [_row_dict(r) for r in rows]
 
 
 def merge_history(new_rows):
-    old = load_history()
-    by_id = {r["match_id"]: r for r in old}
-    added = 0
-    for r in new_rows:
-        if r["match_id"] and r["match_id"] not in by_id:
-            by_id[r["match_id"]] = r
-            added += 1
-        elif r["match_id"] and (r["score"] or r["result"]):
-            by_id[r["match_id"]] = r
-    merged = sorted(by_id.values(), key=lambda r: (r["match_date"], r["match_id"]))
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    HIST_FILE.write_text(json.dumps(merged, ensure_ascii=False, indent=1), encoding="utf-8")
-    with open(HIST_CSV, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(merged)
-    return merged, added
+    """增量合并入库，返回 (全部行, 新增数)"""
+    db_init()
+    with DB_LOCK, db() as conn:
+        added = upsert_matches(conn, new_rows)
+    return load_history(), added
+
+
+def load_onsale():
+    db_init()
+    with DB_LOCK, db() as conn:
+        rows = conn.execute("SELECT payload, fetched_at FROM onsale").fetchall()
+    return [json.loads(r["payload"]) for r in rows], (rows[0]["fetched_at"] if rows else "")
+
+
+def save_onsale(rows):
+    db_init()
+    with DB_LOCK, db() as conn:
+        conn.execute("DELETE FROM onsale")
+        for r in rows:
+            conn.execute("INSERT INTO onsale(match_id, payload, fetched_at) VALUES(?,?,?)",
+                         (r.get("match_id", ""), json.dumps(r, ensure_ascii=False), r.get("fetched_at", "")))
+
+
+# ── 抓取记录（fetch_log 表）：已完整落盘的「过去窗口」不再重复抓 ──
+
+def _load_fetch_log():
+    db_init()
+    with DB_LOCK, db() as conn:
+        rows = conn.execute("SELECT win_begin, win_end FROM fetch_log ORDER BY win_begin").fetchall()
+    return {"windows": [[r["win_begin"], r["win_end"]] for r in rows]}
+
+
+def _save_fetch_log(log):
+    db_init()
+    with DB_LOCK, db() as conn:
+        conn.execute("DELETE FROM fetch_log")
+        for b, e in log.get("windows", []):
+            conn.execute("INSERT OR IGNORE INTO fetch_log(win_begin, win_end) VALUES(?,?)", (b, e))
+
+
+def _next_day(d):
+    return (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _is_past_window(end_str):
+    """窗口结束日早于今天 → 该窗口赛果已定格，抓一次就够（未完赛场次由 match_id 去重兜底）"""
+    return end_str < datetime.now().strftime("%Y-%m-%d")
+
+
+def _window_covered(log, wb, we):
+    """窗口是否已被记录覆盖"""
+    for b, e in log.get("windows", []):
+        if b <= wb and we <= e:
+            return True
+    return False
+
+
+def reset_fetch_log():
+    """清空抓取记录（数据保留，仅强制下次重抓）"""
+    db_init()
+    with DB_LOCK, db() as conn:
+        conn.execute("DELETE FROM fetch_log")
 
 
 def fetch_onsale():
@@ -155,12 +288,7 @@ def fetch_onsale():
     for league in data.get("value", {}).get("matchInfoList", []) or []:
         for m in league.get("subMatchList", []) or []:
             rows.append(map_match(m, now, has_odds=True))
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    ONSALE_FILE.write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
-    with open(ONSALE_CSV, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(rows)
+    save_onsale(rows)
     return rows
 
 
@@ -194,48 +322,6 @@ def daterange_windows(begin, end, days=7):
         we = min(cur + timedelta(days=days - 1), e)
         yield cur.strftime("%Y-%m-%d"), we.strftime("%Y-%m-%d")
         cur = we + timedelta(days=1)
-
-
-# ── 抓取记录（fetch_log）：已完整落盘的「过去窗口」不再重复抓 ──
-
-def _load_fetch_log():
-    if FETCH_LOG_FILE.exists():
-        try:
-            return json.loads(FETCH_LOG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"windows": []}
-
-
-def _save_fetch_log(log):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    # 压缩合并相邻窗口，控制文件体积
-    ws = sorted(set(tuple(w) for w in log.get("windows", [])))
-    merged = []
-    for b, e in ws:
-        if merged and b <= _next_day(merged[-1][1]):
-            merged[-1][1] = max(merged[-1][1], e)
-        else:
-            merged.append([b, e])
-    FETCH_LOG_FILE.write_text(json.dumps({"windows": merged}, ensure_ascii=False, indent=1),
-                              encoding="utf-8")
-
-
-def _next_day(d):
-    return (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-
-
-def _is_past_window(end_str):
-    """窗口结束日早于今天 → 该窗口赛果已定格，抓一次就够（未完赛场次由 match_id 去重兜底）"""
-    return end_str < datetime.now().strftime("%Y-%m-%d")
-
-
-def _window_covered(log, wb, we):
-    """窗口是否已被记录覆盖"""
-    for b, e in log.get("windows", []):
-        if b <= wb and we <= e:
-            return True
-    return False
 
 
 def do_fetch_history(begin, end, progress_cb=None):
@@ -483,9 +569,10 @@ class App(tk.Tk):
         ttk.Button(bar, text="重置抓取记录(强制重抓)", command=self._reset_fetchlog).pack(side="left")
 
     def _backup_data(self):
-        """把 data/ 打包成 zip 备份到用户选的位置"""
+        """把数据库文件打包成 zip 备份到用户选的位置"""
         import zipfile
-        if not DATA_DIR.exists():
+        db_init()
+        if not DB_FILE.exists():
             messagebox.showinfo("提示", "还没有数据可备份")
             return
         f = filedialog.asksaveasfilename(
@@ -494,18 +581,20 @@ class App(tk.Tk):
             filetypes=[("ZIP", "*.zip")])
         if not f:
             return
+        # 先做一份一致性快照，避免备份到写一半的 WAL
+        with DB_LOCK, db() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         with zipfile.ZipFile(f, "w", zipfile.ZIP_DEFLATED) as z:
-            for p in DATA_DIR.iterdir():
-                if p.is_file():
-                    z.write(p, p.name)
-        messagebox.showinfo("完成", f"已备份到:\n{f}")
+            z.write(DB_FILE, DB_FILE.name)
+        messagebox.showinfo("完成", f"已备份 {DB_FILE.name} 到:\n{f}")
 
     def _reset_fetchlog(self):
-        if not FETCH_LOG_FILE.exists():
+        log = _load_fetch_log()
+        if not log.get("windows"):
             messagebox.showinfo("提示", "抓取记录本来就是空的")
             return
         if messagebox.askyesno("确认", "重置后，下次更新会重新抓取所有窗口（数据本身不会丢，只影响去重判断）。确定？"):
-            FETCH_LOG_FILE.unlink()
+            reset_fetch_log()
             self._show_lib_info()
             messagebox.showinfo("完成", "抓取记录已重置")
 
@@ -571,12 +660,7 @@ class App(tk.Tk):
         self._set_status(f"在售数据已更新 {datetime.now().strftime('%H:%M:%S')}")
 
     def _task_load_local(self):
-        rows = []
-        if ONSALE_FILE.exists():
-            try:
-                rows = json.loads(ONSALE_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                rows = []
+        rows, fetched_at = load_onsale()
         self.msgq.put(("local_loaded", (rows, load_history())))
 
     def _fill_onsale(self, rows, from_cache=False):
@@ -706,7 +790,7 @@ class App(tk.Tk):
             f"已保存区间(更新时自动跳过): {cov or '无'}\n"
             f"场次最多的联赛: " + "、".join(f"{k}({v})" for k, v in lg) + "\n"
             f"文件位置: {DATA_DIR}\n"
-            f"文件: history.json / history.csv（长期保存，随更新增量追加）")
+            f"存储: 内置 SQLite 数据库 {DB_FILE.name}（单文件，拷走即全部数据）")
         self.txt_info.config(state="disabled")
 
     def _open_datadir(self):

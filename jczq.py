@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-竞彩足球 胜平负赔率抓取脚本 v1.0
+竞彩足球 胜平负赔率抓取脚本 v1.2 (SQLite 版)
 数据源：体彩官方 API（webapi.sporttery.cn），纯标准库，Python 3.8+ 直接跑，无需 pip install。
 
 用法:
-  python jczq.py current                        # 抓当前在售场次 + 最新赔率
-  python jczq.py history 2026-09-18 2026-10-18  # 抓指定日期区间的完赛结果+收盘赔率
+  python jczq.py current                        # 抓当前在售场次 + 最新赔率（含让球赔率）
+  python jczq.py history 2026-09-18 2026-10-18  # 历史完赛+收盘赔率（增量：已抓窗口自动跳过）
   python jczq.py history 2026-10-18             # 只抓某一天
   python jczq.py all     2026-09-18 2026-10-18  # 在售+历史 一起跑
+  python jczq.py export 2026-09-01 2026-10-18   # 把库导出成 CSV（Excel 可开）
 
-数据落盘（脚本同目录 data/ 下）:
-  onsale.json / onsale.csv      # 在售场次快照（每次覆盖）
-  history.json / history.csv    # 历史完赛（按 match_id 去重合并，可反复增量跑）
-
-字段说明:
-  胜平负赔率 = odds_win / odds_draw / odds_lose（胜-平-负，竞彩官方收盘价）
-  goal_line  = 让球线（+1 主让1球为 -1？注意官方符号：正数=客让？实为盘口线，直接参考官网显示）
-  result     = H/D/A（H=主胜 D=平 A=客胜）
-  score      = 全场比分 "主:客"；half_score = 半场比分
+数据存储: data/jczq.db (内置 SQLite 单文件数据库，与 GUI 版 jczq_app.py 共用)
+  - 首次运行自动把旧版 history.json / fetch_log.json 迁移进库（原文件改名为 .migrated）
+  - 已抓过的「过去窗口」自动跳过，永不重复请求
 """
 
 import sys
-import csv
 import json
 import time
+import sqlite3
 import urllib.request
 import urllib.parse
 from pathlib import Path
@@ -33,14 +28,12 @@ from datetime import datetime, timedelta
 # ── 配置 ─────────────────────────────────────────────
 BASE = "https://webapi.sporttery.cn"
 DATA_DIR = Path(__file__).resolve().parent / "data"
-HIST_FILE = DATA_DIR / "history.json"
-HIST_CSV = DATA_DIR / "history.csv"
-ONSALE_FILE = DATA_DIR / "onsale.json"
-ONSALE_CSV = DATA_DIR / "onsale.csv"
+DB_FILE = DATA_DIR / "jczq.db"
+HIST_FILE = DATA_DIR / "history.json"         # 旧版 JSON（仅用于自动迁移）
+FETCH_LOG_FILE = DATA_DIR / "fetch_log.json"  # 旧版抓取记录（仅用于自动迁移）
+EXPORT_CSV = DATA_DIR / "export.csv"
 
-# 体彩是国内站点，直连即可；本机若有全局代理也强制绕开
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"),
@@ -58,7 +51,6 @@ CSV_FIELDS = [
 
 # ── HTTP ─────────────────────────────────────────────
 def api_get(path, params, retries=3):
-    """GET 体彩官方接口，返回解析后的 JSON dict。失败指数退避重试。"""
     url = BASE + path + "?" + urllib.parse.urlencode(params)
     last_err = None
     for i in range(retries):
@@ -72,13 +64,85 @@ def api_get(path, params, retries=3):
         except Exception as e:  # noqa: BLE001
             last_err = e
             if i < retries - 1:
-                time.sleep(2 * (i + 1))  # 退避 2s / 4s
+                time.sleep(2 * (i + 1))
     raise RuntimeError(f"请求失败(重试{retries}次): {last_err}\n  url={url}")
+
+
+# ── SQLite ───────────────────────────────────────────
+def db():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_FILE, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def db_init():
+    with db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS matches (
+            match_id TEXT PRIMARY KEY, week TEXT, match_num TEXT,
+            league TEXT, home TEXT, away TEXT,
+            match_date TEXT, match_time TEXT,
+            odds_win REAL, odds_draw REAL, odds_lose REAL, goal_line REAL,
+            hhad_win REAL, hhad_draw REAL, hhad_lose REAL,
+            single TEXT, score TEXT, half_score TEXT, result TEXT, fetched_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_matches_date   ON matches(match_date);
+        CREATE INDEX IF NOT EXISTS idx_matches_odds   ON matches(odds_win, odds_draw, odds_lose);
+        CREATE INDEX IF NOT EXISTS idx_matches_result ON matches(result);
+        CREATE INDEX IF NOT EXISTS idx_matches_league ON matches(league);
+        CREATE TABLE IF NOT EXISTS fetch_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            win_begin TEXT NOT NULL, win_end TEXT NOT NULL, UNIQUE(win_begin, win_end)
+        );
+        CREATE TABLE IF NOT EXISTS onsale (
+            match_id TEXT PRIMARY KEY, payload TEXT, fetched_at TEXT
+        );
+        """)
+        # 旧版 JSON 自动迁移
+        if HIST_FILE.exists():
+            try:
+                old = json.loads(HIST_FILE.read_text(encoding="utf-8"))
+                if old:
+                    upsert_matches(conn, old)
+                    HIST_FILE.rename(HIST_FILE.with_suffix(".json.migrated"))
+                    print(f"[迁移] history.json → 数据库: {len(old)} 条")
+            except Exception as e:
+                print(f"[迁移] history.json 失败(保留): {e}")
+        if FETCH_LOG_FILE.exists():
+            try:
+                log = json.loads(FETCH_LOG_FILE.read_text(encoding="utf-8"))
+                for b, e in log.get("windows", []):
+                    conn.execute("INSERT OR IGNORE INTO fetch_log(win_begin, win_end) VALUES(?,?)", (b, e))
+                FETCH_LOG_FILE.rename(FETCH_LOG_FILE.with_suffix(".json.migrated"))
+                print("[迁移] fetch_log.json → 数据库")
+            except Exception as e:
+                print(f"[迁移] fetch_log.json 失败(保留): {e}")
+
+
+def upsert_matches(conn, rows):
+    added = 0
+    upd_cols = [k for k in CSV_FIELDS if k != "match_id"]
+    for r in rows:
+        if not r.get("match_id"):
+            continue
+        vals = [r.get(k, "") for k in CSV_FIELDS]
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO matches (" + ",".join(CSV_FIELDS) + ") VALUES(" +
+            ",".join("?" * len(CSV_FIELDS)) + ")", vals)
+        if cur.rowcount == 1:
+            added += 1
+            continue
+        conn.execute(
+            "UPDATE matches SET " + ",".join(f"{k}=?" for k in upd_cols) +
+            " WHERE match_id=? AND (? != '' OR ? != '' OR score = '')",
+            [r.get(k, "") for k in upd_cols] + [r["match_id"], r.get("score", ""), r.get("result", "")])
+    return added
 
 
 # ── 行映射 ───────────────────────────────────────────
 def _num(v):
-    """转 float，失败返回空串"""
     try:
         return float(v)
     except (TypeError, ValueError):
@@ -86,8 +150,6 @@ def _num(v):
 
 
 def map_match(m, fetched_at, has_odds=True):
-    """接口字段 → 统一行 dict（在售/历史通用）"""
-    # 在售接口: had/hhad 是嵌套对象; 历史接口: h/d/a 直接平铺在 match 上
     if has_odds and isinstance(m.get("had"), dict):
         odds = m["had"]
         h, d, a = odds.get("h"), odds.get("d"), odds.get("a")
@@ -104,12 +166,10 @@ def map_match(m, fetched_at, has_odds=True):
         "match_num": m.get("matchNumStr") or "",
         "league": m.get("leagueNameAbbr") or m.get("leagueName") or m.get("leagueAbbName") or "",
         "home": m.get("homeTeam") or m.get("homeTeamAbbName") or "",
-        "away": m.get("awayTeam") or m.get("awayTeamAbbName") or "",
+        "away": m.get("awayTeam") or m.get("awayTeamAbbrName") or m.get("awayTeamAbbName") or "",
         "match_date": m.get("matchDate") or "",
         "match_time": m.get("matchTime") or "",
-        "odds_win": _num(h),
-        "odds_draw": _num(d),
-        "odds_lose": _num(a),
+        "odds_win": _num(h), "odds_draw": _num(d), "odds_lose": _num(a),
         "goal_line": _num(line),
         "hhad_win": _num(hhad.get("h")) if hhad else "",
         "hhad_draw": _num(hhad.get("d")) if hhad else "",
@@ -122,35 +182,39 @@ def map_match(m, fetched_at, has_odds=True):
     }
 
 
-# ── 存取 ─────────────────────────────────────────────
-def save_json(path, rows):
-    path.write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
+# ── fetch_log（增量去重） ─────────────────────────────
+def _load_fetch_log():
+    with db() as conn:
+        rows = conn.execute("SELECT win_begin, win_end FROM fetch_log ORDER BY win_begin").fetchall()
+    return [[r["win_begin"], r["win_end"]] for r in rows]
 
 
-def save_csv(path, rows):
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:  # BOM: Excel 打开不乱码
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(rows)
+def _merge_windows(ws):
+    """合并相邻/重叠区间"""
+    ws = sorted(set((b, e) for b, e in ws))
+    merged = []
+    for b, e in ws:
+        if merged:
+            nb = (datetime.strptime(merged[-1][1], "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+            if b <= nb:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                continue
+        merged.append((b, e))
+    return merged
 
 
-def merge_history(new_rows):
-    """按 match_id 去重合并进 history.json，返回 (总数, 新增数)"""
-    old = []
-    if HIST_FILE.exists():
-        old = json.loads(HIST_FILE.read_text(encoding="utf-8"))
-    by_id = {r["match_id"]: r for r in old}
-    added = 0
-    for r in new_rows:
-        if r["match_id"] and r["match_id"] not in by_id:
-            by_id[r["match_id"]] = r
-            added += 1
-        elif r["match_id"] and (r["score"] or r["result"]):  # 有新赛果则更新
-            by_id[r["match_id"]] = r
-    merged = sorted(by_id.values(), key=lambda r: (r["match_date"], r["match_id"]))
-    save_json(HIST_FILE, merged)
-    save_csv(HIST_CSV, merged)
-    return len(merged), added
+def _save_fetch_log(windows):
+    with db() as conn:
+        conn.execute("DELETE FROM fetch_log")
+        for b, e in _merge_windows(windows):
+            conn.execute("INSERT INTO fetch_log(win_begin, win_end) VALUES(?,?)", (b, e))
+
+
+def _window_covered(windows, wb, we):
+    for b, e in windows:
+        if b <= wb and we <= e:
+            return True
+    return False
 
 
 # ── 命令：在售 ───────────────────────────────────────
@@ -159,16 +223,19 @@ def cmd_current():
     print("=" * 60)
     print(f"  [在售抓取] {now}")
     print("=" * 60)
+    db_init()
     data = api_get("/gateway/jc/football/getMatchCalculatorV1.qry",
                    {"poolCode": "hhad,had", "channel": "c"})
     rows = []
     for league in data.get("value", {}).get("matchInfoList", []) or []:
         for m in league.get("subMatchList", []) or []:
             rows.append(map_match(m, now, has_odds=True))
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    save_json(ONSALE_FILE, rows)
-    save_csv(ONSALE_CSV, rows)
-    print(f"  在售场次: {len(rows)} 场 → onsale.json / onsale.csv")
+    with db() as conn:
+        conn.execute("DELETE FROM onsale")
+        for r in rows:
+            conn.execute("INSERT INTO onsale(match_id, payload, fetched_at) VALUES(?,?,?)",
+                         (r["match_id"], json.dumps(r, ensure_ascii=False), r["fetched_at"]))
+    print(f"  在售场次: {len(rows)} 场 → 数据库 onsale 表")
     for r in rows[:5]:
         print(f"    {r['week']}{r['match_num']} {r['league']} {r['home']} vs {r['away']} "
               f"| 胜{r['odds_win']} 平{r['odds_draw']} 负{r['odds_lose']} "
@@ -176,47 +243,10 @@ def cmd_current():
     if len(rows) > 5:
         print(f"    ... 共 {len(rows)} 场")
     print("CURRENT_OK:" + str(len(rows)))
-    return rows
 
 
 # ── 命令：历史 ───────────────────────────────────────
-FETCH_LOG_FILE = DATA_DIR / "fetch_log.json"   # 抓取记录：已落盘日期区间
-
-
-def _load_fetch_log():
-    if FETCH_LOG_FILE.exists():
-        try:
-            return json.loads(FETCH_LOG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"windows": []}
-
-
-def _save_fetch_log(log):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    # 合并相邻/重叠窗口，控制文件体积
-    ws = sorted(set(tuple(w) for w in log.get("windows", [])))
-    merged = []
-    for b, e in ws:
-        nb = (datetime.strptime(merged[-1][1], "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d") if merged else None
-        if merged and b <= nb:
-            merged[-1][1] = max(merged[-1][1], e)
-        else:
-            merged.append([b, e])
-    FETCH_LOG_FILE.write_text(json.dumps({"windows": merged}, ensure_ascii=False, indent=1),
-                              encoding="utf-8")
-
-
-def _window_covered(log, wb, we):
-    """窗口是否已被已抓取区间覆盖"""
-    for b, e in log.get("windows", []):
-        if b <= wb and we <= e:
-            return True
-    return False
-
-
 def daterange(begin, end):
-    """按 7 天一窗切分日期区间（官方翻页对大区间不友好，切窗最稳）"""
     b = datetime.strptime(begin, "%Y-%m-%d")
     e = datetime.strptime(end, "%Y-%m-%d")
     if b > e:
@@ -229,19 +259,13 @@ def daterange(begin, end):
 
 
 def fetch_history_window(begin, end):
-    """抓一个日期窗口（自动翻页），返回原始 match list"""
     all_matches = []
     page = 1
     while True:
         data = api_get("/gateway/uniform/football/getUniformMatchResultV1.qry", {
-            "matchPage": "1",           # 固定1=非单页模式（实测必须带）
-            "matchBeginDate": begin,
-            "matchEndDate": end,
-            "leagueId": "",
-            "pageSize": "30",
-            "pageNo": str(page),
-            "isFix": "0",
-            "pcOrWap": "1",
+            "matchPage": "1", "matchBeginDate": begin, "matchEndDate": end,
+            "leagueId": "", "pageSize": "30", "pageNo": str(page),
+            "isFix": "0", "pcOrWap": "1",
         })
         v = data.get("value") or {}
         lst = v.get("matchResult") or []
@@ -250,7 +274,7 @@ def fetch_history_window(begin, end):
         if page * 30 >= total or not lst:
             break
         page += 1
-        time.sleep(0.6)  # 温柔点，别给人家接口干趴了
+        time.sleep(0.6)
     return all_matches
 
 
@@ -259,13 +283,14 @@ def cmd_history(begin, end):
     print("=" * 60)
     print(f"  [历史抓取] {begin} ~ {end}")
     print("=" * 60)
-    log = _load_fetch_log()
+    db_init()
+    windows_log = _load_fetch_log()
     today = datetime.now().strftime("%Y-%m-%d")
     raw_all = []
     skipped = 0
+    new_windows = []
     for wb, we in daterange(begin, end):
-        # 过去且已完整落盘的窗口：直接跳过，不重复请求
-        if we < today and _window_covered(log, wb, we):
+        if we < today and _window_covered(windows_log, wb, we):
             skipped += 1
             print(f"  窗口 {wb}~{we}: 已有数据，跳过")
             continue
@@ -273,14 +298,36 @@ def cmd_history(begin, end):
         done = sum(1 for m in raw if m.get("winFlag") in ("H", "D", "A"))
         print(f"  窗口 {wb}~{we}: {len(raw)} 场（完赛 {done}）")
         raw_all.extend(raw)
-        if we < today:  # 只有过去的窗口才记录为已完成
-            log.setdefault("windows", []).append([wb, we])
-    _save_fetch_log(log)
+        if we < today:
+            new_windows.append((wb, we))
+    _save_fetch_log(windows_log + new_windows)
     rows = [map_match(m, now, has_odds=False) for m in raw_all]
-    total, added = merge_history(rows)
-    print(f"  本轮抓到 {len(rows)} 场，新增 {added} 场，跳过 {skipped} 个已存窗口，历史库共 {total} 场 → history.json / history.csv")
+    with db() as conn:
+        added = upsert_matches(conn, rows)
+    total = 0
+    with db() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
+    print(f"  本轮抓到 {len(rows)} 场，新增 {added} 场，跳过 {skipped} 个已存窗口，库共 {total} 场")
     print(f"HISTORY_OK:{total}(+{added})")
-    return rows
+
+
+# ── 命令：导出 CSV ───────────────────────────────────
+def cmd_export(begin=None, end=None):
+    import csv as _csv
+    db_init()
+    with db() as conn:
+        if begin and end:
+            rows = conn.execute("SELECT * FROM matches WHERE match_date BETWEEN ? AND ? "
+                                "ORDER BY match_date, match_id", (begin, end)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM matches ORDER BY match_date, match_id").fetchall()
+    with open(EXPORT_CSV, "w", newline="", encoding="utf-8-sig") as f:
+        w = _csv.writer(f)
+        w.writerow(CSV_FIELDS)
+        for r in rows:
+            w.writerow(["" if r[k] is None else r[k] for k in CSV_FIELDS])
+    print(f"  导出 {len(rows)} 场 → {EXPORT_CSV} (UTF-8 BOM, Excel直接开)")
+    print(f"EXPORT_OK:{len(rows)}")
 
 
 # ── 入口 ─────────────────────────────────────────────
@@ -294,7 +341,12 @@ def main():
         elif len(sys.argv) == 3:
             cmd_history(sys.argv[2], sys.argv[2])
         else:
-            raise SystemExit("用法: python jczq.py history <开始日> [结束日]  如: history 2026-10-12 2026-10-18")
+            raise SystemExit("用法: python jczq.py history <开始日> [结束日]")
+    elif cmd == "export":
+        if len(sys.argv) >= 4:
+            cmd_export(sys.argv[2], sys.argv[3])
+        else:
+            cmd_export()
     elif cmd == "all":
         if len(sys.argv) >= 4:
             cmd_current()
