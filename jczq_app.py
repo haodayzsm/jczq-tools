@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "v1.4.1"
+APP_VERSION = "v1.4.2"
 
 # 数据目录：exe/script 同目录（打包后也可移植）
 if getattr(sys, "frozen", False):          # PyInstaller 打包后
@@ -115,6 +115,36 @@ def map_match(m, fetched_at, has_odds=True):
         "result": m.get("winFlag") or "",
         "fetched_at": fetched_at,
     }
+
+
+def _derive_result(row):
+    """官方漏发赛果标记时，从比分推导 H/D/A（取消/无效场次不算）"""
+    if row.get("result") in ("H", "D", "A"):
+        return row["result"]
+    score = (row.get("score") or "").strip()
+    if ":" in score:
+        try:
+            hg, ag = [int(x) for x in score.split(":")[:2]]
+        except ValueError:
+            return ""
+        return "H" if hg > ag else ("D" if hg == ag else "A")
+    return ""
+
+
+def repair_results():
+    """一次性修补：给库里有比分但没赛果的场次补算 H/D/A。幂等。"""
+    db_init()
+    fixed = 0
+    with DB_LOCK, db() as conn:
+        rows = conn.execute(
+            "SELECT match_id, score FROM matches "
+            "WHERE (result IS NULL OR result='') AND score LIKE '%_%'").fetchall()
+        for r in rows:
+            res = _derive_result({"result": "", "score": r["score"]})
+            if res:
+                conn.execute("UPDATE matches SET result=? WHERE match_id=?", (res, r["match_id"]))
+                fixed += 1
+    return fixed
 
 
 # ── SQLite 数据库层 ──────────────────────────────────
@@ -798,10 +828,37 @@ class App(tk.Tk):
         self.cb_b_league.grid(row=0, column=3, padx=4)
         self.cb_b_league.bind("<ButtonPress>", self._fill_leagues)
         ttk.Label(self.fr_browse, text="(下拉选联赛，可输入过滤)").grid(row=0, column=4, padx=4)
-        self._dates_browse = self._date_row(self.fr_browse, 1)
+        self._dates_browse = self._date_row(self.fr_browse, 1, default_from="yesterday")
         self.var_b_finished = tk.BooleanVar(value=True)
         ttk.Checkbutton(self.fr_browse, text="只看完赛场次", variable=self.var_b_finished).grid(
             row=1, column=0, columnspan=2, padx=6, pady=(0, 6), sticky="w")
+        # 日期快捷键
+        quick = ttk.Frame(self.fr_browse)
+        quick.grid(row=1, column=2, columnspan=4, padx=6, pady=(0, 6), sticky="w")
+        ttk.Label(quick, text="快捷:").pack(side="left")
+        ttk.Button(quick, text="近7天", width=7,
+                   command=lambda: self._quick_browse_dates(7)).pack(side="left", padx=3)
+        ttk.Button(quick, text="近30天", width=8,
+                   command=lambda: self._quick_browse_dates(30)).pack(side="left", padx=3)
+        ttk.Button(quick, text="近一年", width=8,
+                   command=lambda: self._quick_browse_dates(365)).pack(side="left", padx=3)
+        ttk.Button(quick, text="全部", width=7,
+                   command=lambda: self._quick_browse_dates(0)).pack(side="left", padx=3)
+        # 分页控件
+        pagebar = ttk.Frame(self.fr_browse)
+        pagebar.grid(row=2, column=0, columnspan=8, padx=6, pady=(0, 6), sticky="w")
+        ttk.Label(pagebar, text="每页:").pack(side="left")
+        self.var_b_pagesize = tk.IntVar(value=50)
+        for n in (20, 50, 100, 200):
+            ttk.Radiobutton(pagebar, text=str(n), value=n, variable=self.var_b_pagesize).pack(side="left", padx=2)
+        ttk.Button(pagebar, text="⏮ 首页", width=7, command=lambda: self._browse_page(0)).pack(side="left", padx=(16, 2))
+        ttk.Button(pagebar, text="◀ 上一页", width=8, command=lambda: self._browse_page(self._browse_idx - 1)).pack(side="left", padx=2)
+        ttk.Button(pagebar, text="下一页 ▶", width=8, command=lambda: self._browse_page(self._browse_idx + 1)).pack(side="left", padx=2)
+        ttk.Button(pagebar, text="末页 ⏭", width=7, command=lambda: self._browse_page(10**9)).pack(side="left", padx=2)
+        self.lbl_b_page = ttk.Label(pagebar, text="")
+        self.lbl_b_page.pack(side="left", padx=10)
+        self._browse_idx = 0        # 当前页（0起）
+        self._browse_rows = []      # 当前筛选命中的全部行
         # 球队补全列表
         self.lb_teams = tk.Listbox(tab, height=5, exportselection=False)
         self.lb_teams.bind("<ButtonRelease-1>", self._pick_team)
@@ -840,11 +897,15 @@ class App(tk.Tk):
         self.tv_stat.tag_configure("A", foreground="#2471a3")
         self._stat_rows = []
 
-    def _date_row(self, frame, row):
+    def _date_row(self, frame, row, default_from="2015-01-01"):
         """日期区间输入行（各面板共用），返回 (起, 止) 两个 Entry"""
+        if default_from == "yesterday":
+            d0 = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            d0 = default_from
         ttk.Label(frame, text="日期从:").grid(row=row, column=4, padx=(16, 0), pady=6, sticky="e")
         e = ttk.Entry(frame, width=12)
-        e.insert(0, "2015-01-01")
+        e.insert(0, d0)
         e.grid(row=row, column=5, padx=4)
         ttk.Label(frame, text="到:").grid(row=row, column=6, padx=(12, 0), sticky="e")
         e2 = ttk.Entry(frame, width=12)
@@ -915,6 +976,31 @@ class App(tk.Tk):
         if not self.cb_b_league.cget("values"):
             leagues = [""] + list_leagues()   # 首位空 = 不过滤
             self.cb_b_league.config(values=leagues)
+
+    def _quick_browse_dates(self, days):
+        """快捷日期: 7/30/365天, 0=全部"""
+        d_to = datetime.now().strftime("%Y-%m-%d")
+        d_from = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d") if days else "2015-01-01"
+        self._dates_browse[0].delete(0, "end"); self._dates_browse[0].insert(0, d_from)
+        self._dates_browse[1].delete(0, "end"); self._dates_browse[1].insert(0, d_to)
+
+    def _browse_page(self, idx):
+        """翻页: 渲染当前筛选结果的第 idx 页"""
+        rows = self._browse_rows
+        size = self.var_b_pagesize.get()
+        pages = max(1, (len(rows) + size - 1) // size)
+        idx = max(0, min(idx, pages - 1))
+        self._browse_idx = idx
+        chunk = rows[idx * size:(idx + 1) * size]
+        self.tv_stat.delete(*self.tv_stat.get_children())
+        for r in chunk:
+            self.tv_stat.insert("", "end", tags=(r.get("result") or "",), values=(
+                r["match_date"], f"{r['week']}{r['match_num']}", r["league"], r["home"], r["away"],
+                r["odds_win"], r["odds_draw"], r["odds_lose"], r["goal_line"],
+                r["score"], {"H": "胜", "D": "平", "A": "负"}.get(r.get("result"), r.get("result") or ""),
+                r.get("h2h", "")))
+        self.lbl_b_page.config(text=f"第 {idx+1}/{pages} 页　共 {len(rows)} 条　"
+                                    f"本页 {len(chunk)} 条（{idx*size+1}-{idx*size+len(chunk)}）")
 
     # ── 数据管理页 ──
     def _build_data(self, tab):
@@ -1145,6 +1231,8 @@ class App(tk.Tk):
         self._set_status("统计完成")
 
     def _task_browse(self, df, dt, team, league, finished):
+        if finished:
+            repair_results()   # 顺手补算漏赛果的场次（有比分的）
         rows, stats = stat_browse(df, dt, team, league, finished)
         self.msgq.put(("stat", (rows, stats, "browse", (team, league))))
         self._set_status("查询完成")
@@ -1178,12 +1266,17 @@ class App(tk.Tk):
             cond = []
             if team: cond.append(f"球队含「{team}」")
             if league: cond.append(f"联赛={league}")
+            extra = f"（另有未完赛 {stats.get('n_unfinished', 0)} 场未计入，其中取消/无效场次无赛果）" \
+                    if stats.get("n_unfinished") else ""
             self.lbl_stat.insert("end",
                 f"筛选条件：{'、'.join(cond) or '全部数据'}\n"
-                f"命中 {stats['n']} 场（另有未完赛 {stats.get('n_unfinished', 0)} 场未显示）\n"
+                f"命中 {stats['n']} 场{extra}\n"
                 f"赛果分布：主胜 {stats['win']} 场({stats['p_win']:.1f}%)   "
                 f"平局 {stats['draw']} 场({stats['p_draw']:.1f}%)   客胜 {stats['lose']} 场({stats['p_lose']:.1f}%)\n"
-                f"按日期倒序，可点击「导出CSV」带走")
+                f"按日期倒序分页展示，可点击「导出CSV」带走全部命中数据")
+            self._browse_rows = rows
+            self._browse_idx = 0
+            self._browse_page(0)
         elif mode == "team":
             home, away = args
             if stats.get("single_team"):
@@ -1201,15 +1294,16 @@ class App(tk.Tk):
                     f"平 {stats['draw']} 场({stats['p_draw']:.1f}%)   负 {stats['lose']} 场({stats['p_lose']:.1f}%)\n"
                     f"明细含两队各自的其他比赛（标记「相关」），按日期倒序")
         self.lbl_stat.config(state="disabled")
-        self.tv_stat.delete(*self.tv_stat.get_children())
-        for r in rows:
-            extra = r.get("similarity", r.get("h2h", ""))
-            extra_txt = f"{extra}%" if isinstance(extra, float) else extra
-            self.tv_stat.insert("", "end", tags=(r["result"],), values=(
-                r["match_date"], f"{r['week']}{r['match_num']}", r["league"], r["home"], r["away"],
-                r["odds_win"], r["odds_draw"], r["odds_lose"], r["goal_line"],
-                r["score"], {"H": "胜", "D": "平", "A": "负"}.get(r["result"], r["result"]),
-                extra_txt))
+        if mode != "browse":   # browse 已在分支内分页渲染
+            self.tv_stat.delete(*self.tv_stat.get_children())
+            for r in rows:
+                extra = r.get("similarity", r.get("h2h", ""))
+                extra_txt = f"{extra}%" if isinstance(extra, float) else extra
+                self.tv_stat.insert("", "end", tags=(r["result"],), values=(
+                    r["match_date"], f"{r['week']}{r['match_num']}", r["league"], r["home"], r["away"],
+                    r["odds_win"], r["odds_draw"], r["odds_lose"], r["goal_line"],
+                    r["score"], {"H": "胜", "D": "平", "A": "负"}.get(r["result"], r["result"]),
+                    extra_txt))
         self._stat_rows = rows
 
     def _export_stat(self):
