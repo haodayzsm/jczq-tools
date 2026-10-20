@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "v1.4"
+APP_VERSION = "v1.4.1"
 
 # 数据目录：exe/script 同目录（打包后也可移植）
 if getattr(sys, "frozen", False):          # PyInstaller 打包后
@@ -426,22 +426,26 @@ def _base_filters(r, league="", date_from="", date_to="", finished=True):
 
 
 def _dist_stats(rows, side):
-    """胜平负分布 + 模拟ROI"""
+    """胜平负分布 + 模拟ROI（未完赛场次只计数不进ROI）"""
     n = len(rows)
-    w = sum(1 for r in rows if r["result"] == "H")
-    d = sum(1 for r in rows if r["result"] == "D")
-    l = sum(1 for r in rows if r["result"] == "A")
+    w = sum(1 for r in rows if r.get("result") == "H")
+    d = sum(1 for r in rows if r.get("result") == "D")
+    l = sum(1 for r in rows if r.get("result") == "A")
     key = SIDE_KEYS.get(side)
     roi = 0.0
     if n and side in SIDE_KEYS:
         total_ret = 0.0
+        n_fin = 0
         for r in rows:
-            odds = r[key]
+            if r.get("result") not in ("H", "D", "A"):
+                continue
+            n_fin += 1
+            odds = r.get(key, "")
             if odds == "":
                 continue
             hit = {"H": "win", "D": "draw", "A": "lose"}[r["result"]] == side
             total_ret += (float(odds) - 1) * 2 if hit else -2
-        roi = total_ret / (n * 2) * 100
+        roi = (total_ret / (n_fin * 2) * 100) if n_fin else 0
     return {
         "n": n, "win": w, "draw": d, "lose": l,
         "p_win": w / n * 100 if n else 0,
@@ -547,6 +551,42 @@ def list_teams():
         if r.get("away"):
             teams.add(r["away"])
     return sorted(teams)
+
+
+def list_leagues():
+    """库里出现过的全部联赛（供下拉选择）"""
+    hist = load_history()
+    leagues = [r.get("league") for r in hist if r.get("league")]
+    return sorted(set(leagues))
+
+
+def stat_browse(date_from="", date_to="", team="", league="", only_finished=True):
+    """
+    数据浏览：按日期/球队/联赛筛选库中数据。
+    team 匹配主队或客队；返回 (行列表, 统计dict)
+    """
+    hist = load_history()
+    out = []
+    for r in hist:
+        md = r.get("match_date") or ""
+        if date_from and md < date_from:
+            continue
+        if date_to and md > date_to:
+            continue
+        if team and team not in (r.get("home") or "") and team not in (r.get("away") or ""):
+            continue
+        if league and league != (r.get("league") or ""):
+            continue
+        if only_finished and r.get("result") not in ("H", "D", "A"):
+            continue
+        out.append(r)
+    out.sort(key=lambda r: r.get("match_date") or "", reverse=True)
+    st = _dist_stats(out, "win")
+    st["n_unfinished"] = sum(1 for r in hist
+                             if (not date_from or (r.get("match_date") or "") >= date_from)
+                             and (not date_to or (r.get("match_date") or "") <= date_to)
+                             and r.get("result") not in ("H", "D", "A"))
+    return out, st
 
 
 def stat_team_matches(team_a, team_b, date_from="", date_to=""):
@@ -690,7 +730,8 @@ class App(tk.Tk):
         modebar = ttk.Frame(tab)
         modebar.pack(fill="x", padx=6, pady=(6, 0))
         self.var_mode = tk.StringVar(value="normal")
-        for text, val in (("常规统计", "normal"), ("相似统计", "similar"), ("球队统计", "team")):
+        for text, val in (("常规统计", "normal"), ("相似统计", "similar"),
+                          ("球队统计", "team"), ("数据浏览", "browse")):
             ttk.Radiobutton(modebar, text=text, value=val, variable=self.var_mode,
                             command=self._switch_mode).pack(side="left", padx=10)
 
@@ -744,6 +785,23 @@ class App(tk.Tk):
         self.e_team_a.grid(row=0, column=3, padx=4)
         ttk.Label(self.fr_team, text="(输入时有球队名提示)").grid(row=0, column=4, padx=4)
         self._dates_team = self._date_row(self.fr_team, 1)
+
+        # ── 数据浏览面板 ──
+        self.fr_browse = ttk.LabelFrame(tab, text="数据浏览：查看数据库中符合条件的数据")
+        ttk.Label(self.fr_browse, text="球队:").grid(row=0, column=0, padx=6, pady=8, sticky="e")
+        self.e_b_team = ttk.Entry(self.fr_browse, width=14)
+        self.e_b_team.grid(row=0, column=1, padx=4)
+        self.e_b_team.bind("<KeyRelease>", self._on_team_typing)
+        ttk.Label(self.fr_browse, text="联赛:").grid(row=0, column=2, padx=(12, 0), sticky="e")
+        self.var_b_league = tk.StringVar()
+        self.cb_b_league = ttk.Combobox(self.fr_browse, textvariable=self.var_b_league, width=10)
+        self.cb_b_league.grid(row=0, column=3, padx=4)
+        self.cb_b_league.bind("<ButtonPress>", self._fill_leagues)
+        ttk.Label(self.fr_browse, text="(下拉选联赛，可输入过滤)").grid(row=0, column=4, padx=4)
+        self._dates_browse = self._date_row(self.fr_browse, 1)
+        self.var_b_finished = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.fr_browse, text="只看完赛场次", variable=self.var_b_finished).grid(
+            row=1, column=0, columnspan=2, padx=6, pady=(0, 6), sticky="w")
         # 球队补全列表
         self.lb_teams = tk.Listbox(tab, height=5, exportselection=False)
         self.lb_teams.bind("<ButtonRelease-1>", self._pick_team)
@@ -802,14 +860,14 @@ class App(tk.Tk):
         return "", ""
 
     def _switch_mode(self):
-        for f in (self.fr_normal, self.fr_similar, self.fr_team):
+        for f in (self.fr_normal, self.fr_similar, self.fr_team, self.fr_browse):
             f.pack_forget()
-        {"normal": self.fr_normal, "similar": self.fr_similar, "team": self.fr_team}[self.var_mode.get()].pack(
+        {"normal": self.fr_normal, "similar": self.fr_similar,
+         "team": self.fr_team, "browse": self.fr_browse}[self.var_mode.get()].pack(
             fill="x", padx=6, pady=6, before=self._mode_anchor())
 
     def _mode_anchor(self):
-        # 面板插回按钮行之前
-        return self.master.children.get(list(self.master.children)[0]) if False else self._btnbar_ref
+        return self._btnbar_ref
 
     def _on_team_typing(self, event=None):
         ent = event.widget
@@ -846,9 +904,17 @@ class App(tk.Tk):
         ent.delete(0, "end")
         ent.insert(0, team)
         self.lb_teams.place_forget()
-        # 焦点挪到另一个框，方便连续输入
-        other = self.e_team_a if ent is self.e_team_h else self.e_team_h
-        other.focus_set()
+        # 球队统计面板: 焦点挪到另一个框方便连续输入; 其他面板不动
+        if ent is self.e_team_h:
+            self.e_team_a.focus_set()
+        elif ent is self.e_team_a:
+            self.e_team_h.focus_set()
+
+    def _fill_leagues(self, event=None):
+        """联赛下拉: 点击时懒加载库里全部联赛"""
+        if not self.cb_b_league.cget("values"):
+            leagues = [""] + list_leagues()   # 首位空 = 不过滤
+            self.cb_b_league.config(values=leagues)
 
     # ── 数据管理页 ──
     def _build_data(self, tab):
@@ -1057,6 +1123,11 @@ class App(tk.Tk):
                 messagebox.showwarning("输入有误", "至少填一个球队（只填主队=查该队全部比赛）")
                 return
             self._bg(lambda: self._task_team(home, away, df, dt))
+        elif mode == "browse":
+            team = self.e_b_team.get().strip()
+            league = self.var_b_league.get().strip()
+            finished = self.var_b_finished.get()
+            self._bg(lambda: self._task_browse(df, dt, team, league, finished))
 
     def _task_normal(self, target, pct, side, league, df, dt):
         rows, stats = stat_normal(target, pct, side, league, df, dt)
@@ -1072,6 +1143,11 @@ class App(tk.Tk):
         rows, stats = stat_team_matches(home, away, df, dt)
         self.msgq.put(("stat", (rows, stats, "team", (home, away))))
         self._set_status("统计完成")
+
+    def _task_browse(self, df, dt, team, league, finished):
+        rows, stats = stat_browse(df, dt, team, league, finished)
+        self.msgq.put(("stat", (rows, stats, "browse", (team, league))))
+        self._set_status("查询完成")
 
     def _fill_stat(self, payload):
         rows, stats, mode, args = payload
@@ -1097,6 +1173,17 @@ class App(tk.Tk):
                 f"这批相似场次的赛果分布：主胜 {stats['win']} 场({stats['p_win']:.1f}%)   "
                 f"平局 {stats['draw']} 场({stats['p_draw']:.1f}%)   客胜 {stats['lose']} 场({stats['p_lose']:.1f}%)\n"
                 f"提示: 排名越靠前，赔率结构与输入越接近")
+        elif mode == "browse":
+            team, league = args
+            cond = []
+            if team: cond.append(f"球队含「{team}」")
+            if league: cond.append(f"联赛={league}")
+            self.lbl_stat.insert("end",
+                f"筛选条件：{'、'.join(cond) or '全部数据'}\n"
+                f"命中 {stats['n']} 场（另有未完赛 {stats.get('n_unfinished', 0)} 场未显示）\n"
+                f"赛果分布：主胜 {stats['win']} 场({stats['p_win']:.1f}%)   "
+                f"平局 {stats['draw']} 场({stats['p_draw']:.1f}%)   客胜 {stats['lose']} 场({stats['p_lose']:.1f}%)\n"
+                f"按日期倒序，可点击「导出CSV」带走")
         elif mode == "team":
             home, away = args
             if stats.get("single_team"):
