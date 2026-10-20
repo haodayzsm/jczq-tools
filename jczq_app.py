@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "v1.3.1"
+APP_VERSION = "v1.4"
 
 # 数据目录：exe/script 同目录（打包后也可移植）
 if getattr(sys, "frozen", False):          # PyInstaller 打包后
@@ -278,6 +278,62 @@ def reset_fetch_log():
     db_init()
     with DB_LOCK, db() as conn:
         conn.execute("DELETE FROM fetch_log")
+
+
+def fetch_odds_history(match_id):
+    """调官方赔率历史接口：返回收盘的 胜平负(had) + 让球胜平负(hhad) 赔率"""
+    data = api_get("/gateway/uniform/football/getOddsHistoryV1.qry",
+                   {"matchId": str(match_id)})
+    v = data.get("value") or {}
+    had_list = v.get("hadList") or []
+    hhad_list = v.get("hhadList") or []
+    # 列表按时间倒序，首条即最后更新（收盘价）
+    had = had_list[0] if had_list else {}
+    hhad = hhad_list[0] if hhad_list else {}
+    return {
+        "odds_win": _num(had.get("h")), "odds_draw": _num(had.get("d")), "odds_lose": _num(had.get("a")),
+        "goal_line": _num(hhad.get("goalLine")),
+        "hhad_win": _num(hhad.get("h")), "hhad_draw": _num(hhad.get("d")), "hhad_lose": _num(hhad.get("a")),
+        "odds_snapshots": len(had_list),
+    }
+
+
+def enrich_hhad(progress_cb=None, limit=None):
+    """
+    补全让球赔率：对库里缺 hhad 的场次逐个调赔率历史接口，取收盘价写入。
+    返回 (成功数, 跳过数, 失败数)
+    """
+    db_init()
+    with DB_LOCK, db() as conn:
+        rows = conn.execute(
+            "SELECT match_id FROM matches WHERE (hhad_win IS NULL OR hhad_win='') "
+            "AND result IN ('H','D','A') ORDER BY match_date DESC").fetchall()
+    todo = [r["match_id"] for r in rows]
+    if limit:
+        todo = todo[:limit]
+    ok = fail = skip = 0
+    for i, mid in enumerate(todo, 1):
+        try:
+            odds = fetch_odds_history(mid)
+            if odds["odds_snapshots"] == 0:
+                skip += 1   # 官方无该场赔率记录（老场次或未开售）
+            elif odds["hhad_win"] != "":
+                with DB_LOCK, db() as conn:
+                    conn.execute(
+                        "UPDATE matches SET odds_win=?, odds_draw=?, odds_lose=?, goal_line=?, "
+                        "hhad_win=?, hhad_draw=?, hhad_lose=? WHERE match_id=?",
+                        (odds["odds_win"], odds["odds_draw"], odds["odds_lose"], odds["goal_line"],
+                         odds["hhad_win"], odds["hhad_draw"], odds["hhad_lose"], mid))
+                ok += 1
+            else:
+                skip += 1
+        except Exception:
+            fail += 1
+            time.sleep(1)
+        if progress_cb and (i % 5 == 0 or i == len(todo)):
+            progress_cb(i, len(todo), ok, skip, fail)
+        time.sleep(0.35)   # 温柔限速
+    return ok, skip, fail
 
 
 def fetch_onsale():
@@ -816,6 +872,16 @@ class App(tk.Tk):
         self.lbl_progress = ttk.Label(tab, text="")
         self.lbl_progress.pack(fill="x", padx=10)
 
+        # 让球赔率补全
+        hhad_box = ttk.LabelFrame(tab, text="让球赔率补全（对历史库缺让球赔率的场次，逐场调官方赔率历史接口取收盘价）")
+        hhad_box.pack(fill="x", padx=6, pady=6)
+        bar2 = ttk.Frame(hhad_box)
+        bar2.pack(fill="x", padx=8, pady=6)
+        ttk.Button(bar2, text="⚽ 补全让球赔率", command=self._do_enrich).pack(side="left")
+        ttk.Label(bar2, text="每次处理缺数据的完赛场次，带限速（约每秒3场），可反复点按直到补完").pack(side="left", padx=10)
+        self.lbl_hhad = ttk.Label(hhad_box, text="")
+        self.lbl_hhad.pack(fill="x", padx=8, pady=(0, 4))
+
         # 库信息
         info = ttk.LabelFrame(tab, text="本地数据库")
         info.pack(fill="both", expand=True, padx=6, pady=6)
@@ -901,6 +967,10 @@ class App(tk.Tk):
                     messagebox.showinfo("完成",
                                         f"更新完成！\n本轮抓取 {fetched} 场\n新增 {added} 场\n"
                                         f"跳过 {skipped} 个已保存的窗口\n本地库共 {len(merged)} 场")
+                elif kind == "enrich_progress":
+                    self._show_enrich_progress(*payload)
+                elif kind == "enrich_done":
+                    self._show_enrich_done(*payload)
                 elif kind == "local_loaded":
                     self._fill_onsale(payload[0], from_cache=True)
                     self._show_lib_info(payload[1])
@@ -1091,6 +1161,29 @@ class App(tk.Tk):
             progress_cb=lambda i, n, wb, we, cnt: self.msgq.put(
                 ("hist_progress", (i, n, wb, we, cnt))))
         self.msgq.put(("hist_done", (merged, added, fetched, skipped)))
+
+    # ── 让球赔率补全 ──
+    def _do_enrich(self):
+        self.lbl_hhad.config(text="正在补全…（可在后台跑，期间别关程序）")
+        self._set_status("补全让球赔率中...")
+        self._bg(self._task_enrich)
+
+    def _task_enrich(self):
+        ok, skip, fail = enrich_hhad(
+            progress_cb=lambda i, n, o, s, f: self.msgq.put(
+                ("enrich_progress", (i, n, o, s, f))))
+        self.msgq.put(("enrich_done", (ok, skip, fail)))
+
+    def _show_enrich_progress(self, i, n, ok, skip, fail):
+        self.pbar["value"] = i / n * 100 if n else 100
+        self.lbl_hhad.config(text=f"进度 {i}/{n}　补上 {ok} 场　无记录 {skip} 场　失败 {fail} 场")
+
+    def _show_enrich_done(self, ok, skip, fail):
+        self._show_lib_info()
+        self.lbl_hhad.config(text=f"完成：补上让球赔率 {ok} 场，官方无记录 {skip} 场，失败 {fail} 场"
+                                   + ("" if fail == 0 else "（失败多为网络波动，再点一次即可续补）"))
+        self.status.set("让球赔率补全完成")
+        messagebox.showinfo("完成", f"让球赔率补全完成\n补上 {ok} 场\n无记录 {skip} 场\n失败 {fail} 场")
 
     def _show_lib_info(self, hist=None):
         hist = hist if hist is not None else load_history()
