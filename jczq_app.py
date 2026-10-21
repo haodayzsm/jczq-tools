@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "v1.7"
+APP_VERSION = "v1.7.1"
 
 # 数据目录：exe/script 同目录（打包后也可移植）
 if getattr(sys, "frozen", False):          # PyInstaller 打包后
@@ -328,6 +328,15 @@ def fetch_odds_history(match_id):
     }
 
 
+def _pending_hhad_count():
+    """还缺让球赔率的完赛场次数"""
+    db_init()
+    with DB_LOCK, db() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM matches WHERE (hhad_win IS NULL OR hhad_win='') "
+            "AND result IN ('H','D','A')").fetchone()[0]
+
+
 def enrich_hhad(progress_cb=None, limit=None):
     """
     补全让球赔率：对库里缺 hhad 的场次逐个调赔率历史接口，取收盘价写入。
@@ -447,6 +456,8 @@ def do_fetch_history(begin, end, progress_cb=None):
     _save_fetch_log(log)
     rows = [map_match(m, now, has_odds=False) for m in raw_all]
     merged, added = merge_history(rows)
+    # 顺手补赛果（官方漏发的按比分推导）
+    repair_results()
     return merged, added, len(rows), skipped
 
 
@@ -1208,6 +1219,18 @@ class App(tk.Tk):
                     self._show_enrich_progress(*payload)
                 elif kind == "enrich_done":
                     self._show_enrich_done(*payload)
+                elif kind == "enrich_auto_start":
+                    self.lbl_hhad.config(text=f"数据更新完成 → 自动补全让球赔率（待补 {payload[0]} 场）…")
+                    self.status.set("自动补全让球赔率中...")
+                elif kind == "enrich_auto_done":
+                    ok, skip, fail = payload
+                    self._show_lib_info()
+                    self.lbl_hhad.config(
+                        text=f"✅ 更新+补全一条龙完成：本轮补上让球赔率 {ok} 场"
+                             f"（无记录 {skip}，失败 {fail}）")
+                    self.status.set("更新+补全完成")
+                elif kind == "enrich_auto_skip":
+                    self.lbl_hhad.config(text="✅ 数据已是最新，无需补全让球赔率")
                 elif kind == "local_loaded":
                     self._fill_onsale(payload[0], from_cache=True)
                     self._show_lib_info(payload[1])
@@ -1490,6 +1513,19 @@ class App(tk.Tk):
             progress_cb=lambda i, n, wb, we, cnt: self.msgq.put(
                 ("hist_progress", (i, n, wb, we, cnt))))
         self.msgq.put(("hist_done", (merged, added, fetched, skipped)))
+        # ── 自动接龙：数据更新完 → 直接补全让球赔率 ──
+        n_todo = _pending_hhad_count()
+        if n_todo > 0:
+            self.msgq.put(("enrich_auto_start", (n_todo,)))
+            try:
+                ok, skip, fail = enrich_hhad(
+                    progress_cb=lambda i, n, o, s, f: self.msgq.put(
+                        ("enrich_progress", (i, n, o, s, f))))
+                self.msgq.put(("enrich_auto_done", (ok, skip, fail)))
+            except Exception as e:
+                self.msgq.put(("error", f"让球赔率补全失败: {e}"))
+        else:
+            self.msgq.put(("enrich_auto_skip", ()))
 
     # ── 让球赔率补全 ──
     def _do_enrich(self):
