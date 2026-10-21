@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "v1.5"
+APP_VERSION = "v1.6"
 
 # 数据目录：exe/script 同目录（打包后也可移植）
 if getattr(sys, "frozen", False):          # PyInstaller 打包后
@@ -499,43 +499,84 @@ def _dist_stats(rows, side):
     }
 
 
-def stat_normal(target, pct, side="win", league="", date_from="", date_to=""):
+def stat_normal(ow_t, od_t, ol_t, pct, league="", date_from="", date_to=""):
     """
-    常规统计：目标赔率 ±pct% 区间筛选。
-    side: win/draw/lose/all(=胜平负三项都落在各自区间)
+    常规统计（多赔率可选匹配）：
+    输入的赔率项才参与筛选（各自 ±pct% 区间），没输入的跳过。
+    至少要填一项。返回按日期倒序的结果。
     """
-    if side == "all":
-        # 全部方向：三赔各自独立区间同时命中
-        return stat_all_odds(target, pct, league, date_from, date_to)
-    lo, hi = target * (1 - pct / 100), target * (1 + pct / 100)
     hist = load_history()
-    out = [r for r in hist
-           if _base_filters(r, league, date_from, date_to)
-           and r.get(SIDE_KEYS[side], "") != ""
-           and lo <= float(r[SIDE_KEYS[side]]) <= hi]
-    st = _dist_stats(out, side)
-    st["range"] = (round(lo, 2), round(hi, 2))
-    st["avg_odds"] = (sum(float(r[SIDE_KEYS[side]]) for r in out) / len(out)) if out else 0
-    return out, st
-
-
-def stat_all_odds(target, pct, league="", date_from="", date_to=""):
-    """全部方向：胜/平/负任意一项落在 target±pct% 内即命中"""
-    lo, hi = target * (1 - pct / 100), target * (1 + pct / 100)
-    hist = load_history()
+    conds = []   # [(field, lo, hi), ...]
+    for target, field in ((ow_t, "odds_win"), (od_t, "odds_draw"), (ol_t, "odds_lose")):
+        if target:
+            conds.append((field, target * (1 - pct / 100), target * (1 + pct / 100)))
     out = []
     for r in hist:
+        if not conds:
+            break
         if not _base_filters(r, league, date_from, date_to):
             continue
-        vals = [r.get(k, "") for k in ("odds_win", "odds_draw", "odds_lose")]
-        nums = [float(v) for v in vals if v != ""]
-        if not nums:
-            continue
-        if any(lo <= v <= hi for v in nums):
+        ok = True
+        for field, lo, hi in conds:
+            v = r.get(field, "")
+            if v == "" or not (lo <= float(v) <= hi):
+                ok = False
+                break
+        if ok:
             out.append(r)
+    out.sort(key=lambda r: r.get("match_date") or "", reverse=True)
     st = _dist_stats(out, "win")
-    st["range"] = (round(lo, 2), round(hi, 2))
+    st["conds"] = [(f, round(lo, 2), round(hi)) for f, lo, hi in conds]
     return out, st
+
+
+def recommend_outcome(rows):
+    """
+    胜负率推荐算法（均值回归模型）：
+    思路：样本整体的胜平负分布是"基线"；给近期场次更高权重算出"近期倾向"；
+    若近期某方向明显热于基线（连出多场），按均值回归假设下一场该方向概率回调。
+    返回 dict（不足5场样本时返回 None）
+    """
+    n = len(rows)
+    if n < 5:
+        return None
+    fin = [r for r in rows if r.get("result") in ("H", "D", "A")]
+    n = len(fin)
+    if n < 5:
+        return None
+    # 基线分布
+    base = [sum(1 for r in fin if r["result"] == k) / n for k in ("H", "D", "A")]
+    # 近期加权分布（rows已按日期倒序, 越新权重越大, 半衰期=n/3）
+    import math
+    tau = max(3.0, n / 3)
+    ws, wh, wd, wl = 0.0, 0.0, 0.0, 0.0
+    for i, r in enumerate(fin):
+        w = math.exp(-i / tau)
+        ws += w
+        if r["result"] == "H": wh += w
+        elif r["result"] == "D": wd += w
+        else: wl += w
+    recent = [wh / ws, wd / ws, wl / ws] if ws else list(base)
+    # 均值回归: 从基线出发, 反向修正近期偏离 (beta=0.6)
+    beta = 0.6
+    rec = [max(0.05, base[i] - beta * (recent[i] - base[i])) for i in range(3)]
+    s = sum(rec)
+    rec = [x / s for x in rec]
+    names = ["胜", "平", "负"]
+    pick = rec.index(max(rec))
+    # 各方向平均赔率(用于公平赔率对照)
+    avg_odds = []
+    for field in ("odds_win", "odds_draw", "odds_lose"):
+        vals = [float(r[field]) for r in fin if r.get(field) != ""]
+        avg_odds.append(sum(vals) / len(vals) if vals else 0)
+    return {
+        "n": n,
+        "base": base, "recent": recent, "rec": rec,
+        "pick": names[pick],
+        "fair_odds": [1 / x for x in rec],
+        "avg_odds": avg_odds,
+        "hot": names[recent.index(max(recent))],
+    }
 
 
 def _implied_probs(ow, od, ol):
@@ -574,12 +615,14 @@ def stat_similar_match(ow, od, ol, top_n=20, date_from="", date_to=""):
         scored.append((_dist(tp, p), r))
     scored.sort(key=lambda x: x[0])
     top = scored[:top_n]
+    # 展示按日期倒序（相似度保留在列中）
     rows = []
     for rank, (d, r) in enumerate(top, 1):
         r2 = dict(r)
         r2["similarity"] = round(max(0.0, 1 - d) * 100, 1)   # 0-100%，1-距离 归一化
         r2["rank"] = rank
         rows.append(r2)
+    rows.sort(key=lambda r: r.get("match_date") or "", reverse=True)   # 按日期倒序展示
     st = _dist_stats(rows, "win")
     st["target_probs"] = tuple(round(x * 100, 1) for x in tp)
     return rows, st
@@ -780,26 +823,27 @@ class App(tk.Tk):
                             command=self._switch_mode).pack(side="left", padx=10)
 
         # ── 常规面板 ──
-        self.fr_normal = ttk.LabelFrame(tab, text="常规统计：赔率区间筛选")
+        self.fr_normal = ttk.LabelFrame(tab, text="常规统计：填几项赔率就按几项匹配（没填的不参与），区间=各自±浮动%")
         self.fr_normal.pack(fill="x", padx=6, pady=6)
-        ttk.Label(self.fr_normal, text="目标赔率:").grid(row=0, column=0, padx=6, pady=8, sticky="e")
-        self.e_target = ttk.Entry(self.fr_normal, width=10)
-        self.e_target.insert(0, "2.5")
-        self.e_target.grid(row=0, column=1, padx=4)
-        ttk.Label(self.fr_normal, text="浮动 ±(%):").grid(row=0, column=2, padx=(16, 0), sticky="e")
+        ttk.Label(self.fr_normal, text="浮动 ±(%):").grid(row=0, column=0, padx=6, pady=8, sticky="e")
         self.e_pct = ttk.Entry(self.fr_normal, width=8)
         self.e_pct.insert(0, "8")
-        self.e_pct.grid(row=0, column=3, padx=4)
-        ttk.Label(self.fr_normal, text="统计方向:").grid(row=0, column=4, padx=(16, 0), sticky="e")
-        self.var_side = tk.StringVar(value="胜")
-        ttk.Combobox(self.fr_normal, textvariable=self.var_side, width=6, state="readonly",
-                     values=["全部", "胜", "平", "负"]).grid(row=0, column=5, padx=4)
-        ttk.Label(self.fr_normal, text="(全部=胜平负三项都落在区间内)").grid(row=0, column=6, padx=4)
+        self.e_pct.grid(row=0, column=1, padx=4)
+        ttk.Label(self.fr_normal, text="胜赔:").grid(row=0, column=2, padx=(14, 0), sticky="e")
+        self.e_ow = ttk.Entry(self.fr_normal, width=9)
+        self.e_ow.grid(row=0, column=3, padx=4)
+        ttk.Label(self.fr_normal, text="平赔:").grid(row=0, column=4, padx=(10, 0), sticky="e")
+        self.e_od = ttk.Entry(self.fr_normal, width=9)
+        self.e_od.grid(row=0, column=5, padx=4)
+        ttk.Label(self.fr_normal, text="负赔:").grid(row=0, column=6, padx=(10, 0), sticky="e")
+        self.e_ol = ttk.Entry(self.fr_normal, width=9)
+        self.e_ol.grid(row=0, column=7, padx=4)
+        ttk.Label(self.fr_normal, text="(至少填一项)").grid(row=0, column=8, padx=4)
 
         ttk.Label(self.fr_normal, text="联赛过滤:").grid(row=1, column=0, padx=6, pady=6, sticky="e")
         self.e_league = ttk.Entry(self.fr_normal, width=10)
         self.e_league.grid(row=1, column=1, padx=4)
-        self._dates_normal = self._date_row(self.fr_normal, 1)
+        self._dates_normal = self._date_row(self.fr_normal, 1, default_from="month")
 
         # ── 相似面板 ──
         self.fr_similar = ttk.LabelFrame(tab, text="相似统计：输入一场比赛的胜平负赔率，找历史上最像的场次")
@@ -817,7 +861,7 @@ class App(tk.Tk):
         self.e_s_top = ttk.Entry(self.fr_similar, width=6); self.e_s_top.insert(0, "20")
         self.e_s_top.grid(row=0, column=7, padx=4)
         ttk.Label(self.fr_similar, text="(按相似度排名取前N场)").grid(row=0, column=8, padx=4)
-        self._dates_similar = self._date_row(self.fr_similar, 1)
+        self._dates_similar = self._date_row(self.fr_similar, 1, default_from="month")
 
         # ── 球队面板 ──
         self.fr_team = ttk.LabelFrame(tab, text="球队统计：输入两队名字，查历史交锋与相关比赛")
@@ -828,7 +872,7 @@ class App(tk.Tk):
         self.e_team_a = ttk.Entry(self.fr_team, width=14)
         self.e_team_a.grid(row=0, column=3, padx=4)
         ttk.Label(self.fr_team, text="(输入时有球队名提示)").grid(row=0, column=4, padx=4)
-        self._dates_team = self._date_row(self.fr_team, 1)
+        self._dates_team = self._date_row(self.fr_team, 1, default_from="month")
 
         # ── 数据浏览面板 ──
         self.fr_browse = ttk.LabelFrame(tab, text="数据浏览：查看数据库中符合条件的数据")
@@ -887,34 +931,44 @@ class App(tk.Tk):
         ttk.Button(btnbar, text="导出CSV", command=self._export_stat).pack(side="left", padx=8)
         self._btnbar_ref = btnbar
 
-        # 统计摘要
+        # 统计摘要（推荐算法输出行数变多, 加高）
         mid = ttk.LabelFrame(tab, text="统计结果")
         mid.pack(fill="x", padx=6, pady=(0, 6))
-        self.lbl_stat = tk.Text(mid, height=6, wrap="word", font=("Microsoft YaHei", 10), bg="#fafcff", relief="flat")
+        self.lbl_stat = tk.Text(mid, height=8, wrap="word", font=("Microsoft YaHei", 10), bg="#fafcff", relief="flat")
         self.lbl_stat.pack(fill="x", padx=6, pady=4)
 
-        # 明细表
-        wrap = ttk.LabelFrame(tab, text="匹配场次明细")
+        # 明细表：列重排（日期/联赛/主队/客队/比分/赛果/胜平负赔/让球/让球赔率/备注）
+        wrap = ttk.LabelFrame(tab, text="匹配场次明细（按日期倒序）")
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        cols = ("date", "week", "league", "home", "away", "ow", "od", "oa", "line", "score", "result", "extra")
-        heads = ("日期", "场次", "联赛", "主队", "客队", "胜赔", "平赔", "负赔", "让球", "比分", "赛果", "相似度/交锋")
+        cols = ("date", "week", "league", "home", "away", "score", "result",
+                "ow", "od", "oa", "line", "hw", "hd", "ha", "extra")
+        heads = ("日期", "场次", "联赛", "主队", "客队", "比分", "赛果",
+                 "胜赔", "平赔", "负赔", "让球", "让胜", "让平", "让负", "备注")
+        widths = (78, 66, 60, 110, 110, 58, 46, 56, 56, 56, 50, 56, 56, 56, 90)
         self.tv_stat = ttk.Treeview(wrap, columns=cols, show="headings", height=14)
-        for c, h in zip(cols, heads):
+        for c, h, w in zip(cols, heads, widths):
             self.tv_stat.heading(c, text=h)
-            self.tv_stat.column(c, width=90 if c not in ("home", "away", "extra") else (120 if c != "extra" else 100), anchor="center")
+            self.tv_stat.column(c, width=w, minwidth=40, anchor="center")
+        # 水平滚动（列多了防止挤爆）
+        hs = ttk.Scrollbar(wrap, orient="horizontal", command=self.tv_stat.xview)
+        self.tv_stat.configure(xscrollcommand=hs.set)
         vs = ttk.Scrollbar(wrap, orient="vertical", command=self.tv_stat.yview)
         self.tv_stat.configure(yscrollcommand=vs.set)
-        self.tv_stat.pack(side="left", fill="both", expand=True)
+        self.tv_stat.pack(side="top", fill="both", expand=True)
         vs.pack(side="right", fill="y")
+        hs.pack(side="bottom", fill="x")
         self.tv_stat.tag_configure("H", foreground="#c0392b")
         self.tv_stat.tag_configure("D", foreground="#7f8c8d")
         self.tv_stat.tag_configure("A", foreground="#2471a3")
+        self.tv_stat.tag_configure("odd", background="#f5f7fa")
         self._stat_rows = []
 
     def _date_row(self, frame, row, default_from="2015-01-01"):
         """日期区间输入行（各面板共用），返回 (起, 止) 两个 Entry"""
         if default_from == "yesterday":
             d0 = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        elif default_from == "month":
+            d0 = (datetime.now() - timedelta(days=29)).strftime("%Y-%m-%d")
         else:
             d0 = default_from
         ttk.Label(frame, text="日期从:").grid(row=row, column=4, padx=(16, 0), pady=6, sticky="e")
@@ -1007,16 +1061,20 @@ class App(tk.Tk):
         self._browse_idx = idx
         chunk = rows[idx * size:(idx + 1) * size]
         self.tv_stat.delete(*self.tv_stat.get_children())
-        for r in chunk:
+        for i, r in enumerate(chunk):
             # 悬殊场次官方只开让球盘 → 不让球赔率为空, 标注说明
             if not r.get("odds_win") and r.get("hhad_win"):
                 extra = "仅让球盘"
             else:
                 extra = r.get("h2h", "")
-            self.tv_stat.insert("", "end", tags=(r.get("result") or "",), values=(
+            res = r.get("result") or ""
+            tags = [res] + (["odd"] if i % 2 else [])
+            self.tv_stat.insert("", "end", tags=tags, values=(
                 r["match_date"], f"{r['week']}{r['match_num']}", r["league"], r["home"], r["away"],
-                r["odds_win"], r["odds_draw"], r["odds_lose"], r["goal_line"],
-                r["score"], {"H": "胜", "D": "平", "A": "负"}.get(r.get("result"), r.get("result") or ""),
+                r.get("score", ""), {"H": "胜", "D": "平", "A": "负"}.get(res, res),
+                r.get("odds_win", ""), r.get("odds_draw", ""), r.get("odds_lose", ""),
+                r.get("goal_line", ""),
+                r.get("hhad_win", ""), r.get("hhad_draw", ""), r.get("hhad_lose", ""),
                 extra))
         self.lbl_b_page.config(text=f"第 {idx+1}/{pages} 页　共 {len(rows)} 条　"
                                     f"本页 {len(chunk)} 条（{idx*size+1}-{idx*size+len(chunk)}）")
@@ -1201,16 +1259,24 @@ class App(tk.Tk):
         self._set_status("统计中...")
         if mode == "normal":
             try:
-                target = float(self.e_target.get())
                 pct = float(self.e_pct.get())
-                if target <= 0 or pct < 0:
+                if pct < 0:
                     raise ValueError
+                def _f(entry):
+                    t = entry.get().strip()
+                    return float(t) if t else None
+                ow_t, od_t, ol_t = _f(self.e_ow), _f(self.e_od), _f(self.e_ol)
+                if ow_t is not None and ow_t <= 0: raise ValueError
+                if od_t is not None and od_t <= 0: raise ValueError
+                if ol_t is not None and ol_t <= 0: raise ValueError
+                if not any(v is not None for v in (ow_t, od_t, ol_t)):
+                    messagebox.showwarning("输入有误", "至少填一项赔率（胜/平/负任选）")
+                    return
             except ValueError:
                 messagebox.showwarning("输入有误", "赔率必须是正数，浮动百分比必须≥0")
                 return
-            side = {"全部": "all", "胜": "win", "平": "draw", "负": "lose"}[self.var_side.get()]
             league = self.e_league.get().strip()
-            self._bg(lambda: self._task_normal(target, pct, side, league, df, dt))
+            self._bg(lambda: self._task_normal(ow_t, od_t, ol_t, pct, league, df, dt))
         elif mode == "similar":
             try:
                 ow, od, ol = (float(self.e_s_ow.get()), float(self.e_s_od.get()), float(self.e_s_ol.get()))
@@ -1234,14 +1300,16 @@ class App(tk.Tk):
             finished = self.var_b_finished.get()
             self._bg(lambda: self._task_browse(df, dt, team, league, finished))
 
-    def _task_normal(self, target, pct, side, league, df, dt):
-        rows, stats = stat_normal(target, pct, side, league, df, dt)
-        self.msgq.put(("stat", (rows, stats, "normal", (target, pct, side))))
+    def _task_normal(self, ow_t, od_t, ol_t, pct, league, df, dt):
+        rows, stats = stat_normal(ow_t, od_t, ol_t, pct, league, df, dt)
+        rec = recommend_outcome(rows)
+        self.msgq.put(("stat", (rows, stats, "normal", (ow_t, od_t, ol_t, pct, rec))))
         self._set_status("统计完成")
 
     def _task_similar(self, ow, od, ol, topn, df, dt):
         rows, stats = stat_similar_match(ow, od, ol, topn, df, dt)
-        self.msgq.put(("stat", (rows, stats, "similar", (ow, od, ol, topn))))
+        rec = recommend_outcome(rows)
+        self.msgq.put(("stat", (rows, stats, "similar", (ow, od, ol, topn, rec))))
         self._set_status("统计完成")
 
     def _task_team(self, home, away, df, dt):
@@ -1261,25 +1329,41 @@ class App(tk.Tk):
         self.lbl_stat.config(state="normal")
         self.lbl_stat.delete("1.0", "end")
         if mode == "normal":
-            target, pct, side = args
-            lo, hi = stats["range"]
-            cn = {"win": "胜", "draw": "平", "lose": "负", "all": "全部"}[side]
+            ow_t, od_t, ol_t, pct, rec = args
+            cn = {"odds_win": "胜赔", "odds_draw": "平赔", "odds_lose": "负赔"}
+            cond_txt = "、".join(f"{cn[f]} {lo}~{hi}" for f, lo, hi in stats.get("conds", []))
             self.lbl_stat.insert("end",
-                f"查询条件：{cn}赔 {target} ±{pct}%  →  区间 [{lo} ~ {hi}]　共命中 {stats['n']} 场完赛\n"
+                f"查询条件（浮动±{pct}%）：{cond_txt}　共命中 {stats['n']} 场完赛（按日期倒序）\n"
                 f"赛果分布：主胜 {stats['win']} 场({stats['p_win']:.1f}%)   平局 {stats['draw']} 场({stats['p_draw']:.1f}%)   "
-                f"客胜 {stats['lose']} 场({stats['p_lose']:.1f}%)\n"
-                + (f"该区间平均{cn}赔率: {stats['avg_odds']:.2f}　" if side != "all" else "")
-                + f"模拟回报: 每场买2元「{cn if side != 'all' else '胜'}」，总投入 {stats['n']*2} 元，ROI {stats['roi']:+.1f}%\n"
-                f"提示: 赛果颜色 红=胜 灰=平 蓝=负（相对主队）")
+                f"客胜 {stats['lose']} 场({stats['p_lose']:.1f}%)　模拟买「胜」ROI {stats['roi']:+.1f}%\n")
+            if rec:
+                self.lbl_stat.insert("end",
+                    f"胜负率推荐（均值回归模型）：✅ 推荐「{rec['pick']}」　"
+                    f"预估概率 胜{rec['rec'][0]*100:.0f}% / 平{rec['rec'][1]*100:.0f}% / 负{rec['rec'][2]*100:.0f}%\n"
+                    f"　基线分布 胜{rec['base'][0]*100:.0f}/平{rec['base'][1]*100:.0f}/负{rec['base'][2]*100:.0f}　"
+                    f"近期倾向 胜{rec['recent'][0]*100:.0f}/平{rec['recent'][1]*100:.0f}/负{rec['recent'][2]*100:.0f}"
+                    f"（近期「{rec['hot']}」偏热 → 按均值回归下调）\n"
+                    f"　公平赔率参考: 胜{rec['fair_odds'][0]:.2f} 平{rec['fair_odds'][1]:.2f} 负{rec['fair_odds'][2]:.2f}"
+                    f"　vs 样本平均赔率: 胜{rec['avg_odds'][0]:.2f} 平{rec['avg_odds'][1]:.2f} 负{rec['avg_odds'][2]:.2f}")
+            else:
+                self.lbl_stat.insert("end", "（样本不足5场，胜负率推荐不可用）")
         elif mode == "similar":
-            ow, od, ol, topn = args
+            ow, od, ol, topn, rec = args
             tp = stats.get("target_probs", ("?","?","?"))
             self.lbl_stat.insert("end",
                 f"查询条件：赔率 {ow}/{od}/{ol}（隐含概率 胜{tp[0]}% 平{tp[1]}% 负{tp[2]}%，已去水）\n"
-                f"按相似度取前 {stats['n']} 场（相似度=赔率结构吻合度，100%=完全一致）\n"
+                f"取相似度前 {stats['n']} 场，按日期倒序展示（相似度见明细列）\n"
                 f"这批相似场次的赛果分布：主胜 {stats['win']} 场({stats['p_win']:.1f}%)   "
-                f"平局 {stats['draw']} 场({stats['p_draw']:.1f}%)   客胜 {stats['lose']} 场({stats['p_lose']:.1f}%)\n"
-                f"提示: 排名越靠前，赔率结构与输入越接近")
+                f"平局 {stats['draw']} 场({stats['p_draw']:.1f}%)   客胜 {stats['lose']} 场({stats['p_lose']:.1f}%)\n")
+            if rec:
+                self.lbl_stat.insert("end",
+                    f"胜负率推荐（均值回归模型）：✅ 推荐「{rec['pick']}」　"
+                    f"预估概率 胜{rec['rec'][0]*100:.0f}% / 平{rec['rec'][1]*100:.0f}% / 负{rec['rec'][2]*100:.0f}%\n"
+                    f"　基线 胜{rec['base'][0]*100:.0f}/平{rec['base'][1]*100:.0f}/负{rec['base'][2]*100:.0f}　"
+                    f"近期 胜{rec['recent'][0]*100:.0f}/平{rec['recent'][1]*100:.0f}/负{rec['recent'][2]*100:.0f}"
+                    f"（近期「{rec['hot']}」偏热 → 下调）　公平赔率: 胜{rec['fair_odds'][0]:.2f} 平{rec['fair_odds'][1]:.2f} 负{rec['fair_odds'][2]:.2f}")
+            else:
+                self.lbl_stat.insert("end", "（样本不足5场，胜负率推荐不可用）")
         elif mode == "browse":
             team, league = args
             cond = []
@@ -1315,13 +1399,17 @@ class App(tk.Tk):
         self.lbl_stat.config(state="disabled")
         if mode != "browse":   # browse 已在分支内分页渲染
             self.tv_stat.delete(*self.tv_stat.get_children())
-            for r in rows:
+            for i, r in enumerate(rows):
                 extra = r.get("similarity", r.get("h2h", ""))
                 extra_txt = f"{extra}%" if isinstance(extra, float) else extra
-                self.tv_stat.insert("", "end", tags=(r["result"],), values=(
+                res = r.get("result") or ""
+                tags = [res] + (["odd"] if i % 2 else [])
+                self.tv_stat.insert("", "end", tags=tags, values=(
                     r["match_date"], f"{r['week']}{r['match_num']}", r["league"], r["home"], r["away"],
-                    r["odds_win"], r["odds_draw"], r["odds_lose"], r["goal_line"],
-                    r["score"], {"H": "胜", "D": "平", "A": "负"}.get(r["result"], r["result"]),
+                    r.get("score", ""), {"H": "胜", "D": "平", "A": "负"}.get(res, res),
+                    r.get("odds_win", ""), r.get("odds_draw", ""), r.get("odds_lose", ""),
+                    r.get("goal_line", ""),
+                    r.get("hhad_win", ""), r.get("hhad_draw", ""), r.get("hhad_lose", ""),
                     extra_txt))
         self._stat_rows = rows
 
