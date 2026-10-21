@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "v1.6.1"
+APP_VERSION = "v1.7"
 
 # 数据目录：exe/script 同目录（打包后也可移植）
 if getattr(sys, "frozen", False):          # PyInstaller 打包后
@@ -759,7 +759,20 @@ class App(tk.Tk):
             style.theme_use("vista")
         except tk.TclError:
             pass
-        style.configure("Treeview", rowheight=24)
+        # 全局字体调大
+        import tkinter.font as tkfont
+        for fname in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            try:
+                tkfont.nametofont(fname).configure(size=12)
+            except tk.TclError:
+                pass
+        style.configure("Treeview", rowheight=30, font=("Microsoft YaHei", 12))
+        style.configure("Treeview.Heading", font=("Microsoft YaHei", 12, "bold"))
+        style.configure("TLabel", font=("Microsoft YaHei", 12))
+        style.configure("TButton", font=("Microsoft YaHei", 12))
+        style.configure("TCheckbutton", font=("Microsoft YaHei", 12))
+        style.configure("TRadiobutton", font=("Microsoft YaHei", 12))
+        style.configure("TNotebook.Tab", font=("Microsoft YaHei", 13, "bold"))
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=6, pady=6)
@@ -934,18 +947,18 @@ class App(tk.Tk):
         # 统计摘要（推荐算法输出行数变多, 加高）
         mid = ttk.LabelFrame(tab, text="统计结果")
         mid.pack(fill="x", padx=6, pady=(0, 6))
-        self.lbl_stat = tk.Text(mid, height=8, wrap="word", font=("Microsoft YaHei", 10), bg="#fafcff", relief="flat")
+        self.lbl_stat = tk.Text(mid, height=8, wrap="word", font=("Microsoft YaHei", 11), bg="#fafcff", relief="flat")
         self.lbl_stat.pack(fill="x", padx=6, pady=4)
 
-        # 明细表：500.com风格 —— 主队/比分/客队居中，不让球与让球两组赔率并排各占一格
-        wrap = ttk.LabelFrame(tab, text="匹配场次明细（按日期倒序，赔率=不让球 / 让球）")
+        # 明细表：Excel示例格式 —— 每场两行(第一行不让球/第二行让球), 胜平负分列
+        wrap = ttk.LabelFrame(tab, text="匹配场次明细（每场两行：上=不让球，下=让球；按日期倒序）")
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        cols = ("date", "week", "league", "home", "score", "away", "result",
-                "had_odds", "hhad_odds", "extra")
-        heads = ("日期", "场次", "联赛", "主队", "比分", "客队", "赛果",
-                 "不让球 胜/平/负", "让球 胜/平/负", "备注")
-        widths = (78, 66, 62, 115, 58, 115, 46, 130, 130, 80)
-        self.tv_stat = ttk.Treeview(wrap, columns=cols, show="headings", height=14)
+        cols = ("date", "week", "league", "home", "away", "line",
+                "ow", "od", "oa", "score", "result", "extra")
+        heads = ("日期", "场次", "联赛", "主队", "客队", "让球",
+                 "胜", "平", "负", "比分", "赛果", "备注")
+        widths = (84, 74, 70, 128, 128, 50, 60, 60, 60, 64, 52, 84)
+        self.tv_stat = ttk.Treeview(wrap, columns=cols, show="headings", height=12)
         for c, h, w in zip(cols, heads, widths):
             self.tv_stat.heading(c, text=h)
             self.tv_stat.column(c, width=w, minwidth=40, anchor="center")
@@ -1061,13 +1074,16 @@ class App(tk.Tk):
         self._browse_idx = idx
         chunk = rows[idx * size:(idx + 1) * size]
         self.tv_stat.delete(*self.tv_stat.get_children())
+        n_rows = 0
         for i, r in enumerate(chunk):
             # 悬殊场次官方只开让球盘 → 备注说明
             if not r.get("odds_win") and r.get("hhad_win"):
                 extra = "仅让球盘"
             else:
                 extra = r.get("h2h", "")
-            self.tv_stat.insert("", "end", tags=self._row_tags(r, i), values=self._row_values(r, extra))
+            for item in self._match_row_items(r, i, extra):
+                self.tv_stat.insert("", "end", tags=item["tags"], values=item["values"])
+                n_rows += 1
         self.lbl_b_page.config(text=f"第 {idx+1}/{pages} 页　共 {len(rows)} 条　"
                                     f"本页 {len(chunk)} 条（{idx*size+1}-{idx*size+len(chunk)}）")
 
@@ -1106,7 +1122,7 @@ class App(tk.Tk):
         # 库信息
         info = ttk.LabelFrame(tab, text="本地数据库")
         info.pack(fill="both", expand=True, padx=6, pady=6)
-        self.txt_info = tk.Text(info, height=10, wrap="word", font=("Microsoft YaHei", 10), bg="#fafcff", relief="flat")
+        self.txt_info = tk.Text(info, height=10, wrap="word", font=("Microsoft YaHei", 11), bg="#fafcff", relief="flat")
         self.txt_info.pack(fill="both", expand=True, padx=6, pady=4)
         bar = ttk.Frame(info)
         bar.pack(fill="x", padx=6, pady=4)
@@ -1388,39 +1404,55 @@ class App(tk.Tk):
             for i, r in enumerate(rows):
                 extra = r.get("similarity", r.get("h2h", ""))
                 extra_txt = f"{extra}%" if isinstance(extra, float) else extra
-                self.tv_stat.insert("", "end", tags=self._row_tags(r, i), values=self._row_values(r, extra_txt))
+                for item in self._match_row_items(r, i, extra_txt):
+                    self.tv_stat.insert("", "end", tags=item["tags"], values=item["values"])
         self._stat_rows = rows
 
     @staticmethod
-    def _fmt_odds(w, d, l):
-        """三赔合并一格: 1.57/3.95/4.20（缺项显示-）"""
-        def s(v):
-            try:
-                return f"{float(v):.2f}"
-            except (TypeError, ValueError):
-                return "-"
-        return f"{s(w)}/{s(d)}/{s(l)}"
-
-    def _row_values(self, r, extra_txt=""):
-        """一行数据的 500 风格值"""
-        res = r.get("result") or ""
-        line = r.get("goal_line", "")
-        line_s = f"({line:+g})" if line != "" and line is not None else ""
-        hhad = self._fmt_odds(r.get("hhad_win"), r.get("hhad_draw"), r.get("hhad_lose"))
-        if hhad == "-/-/-":
-            hhad = "仅让球盘未开" if not r.get("odds_win") else ""
-        return (
-            r["match_date"], f"{r['week']}{r['match_num']}", r["league"],
-            r["home"], r.get("score", ""), r["away"],
-            {"H": "胜", "D": "平", "A": "负"}.get(res, res),
-            self._fmt_odds(r.get("odds_win"), r.get("odds_draw"), r.get("odds_lose")),
-            (f"{line_s} " + hhad).strip() if line_s else hhad,
-            extra_txt)
+    def _odds_s(v):
+        """单赔率格: 2.58（缺显示-）"""
+        try:
+            return f"{float(v):.2f}"
+        except (TypeError, ValueError):
+            return "-"
 
     @staticmethod
-    def _row_tags(r, i):
+    def _handicap_res(score, line):
+        """让球后赛果: 主队得分+让球线 与 客队比"""
+        try:
+            hg, ag = [int(x) for x in score.split(":")[:2]]
+            adj = hg + float(line)
+            return "H" if adj > ag else ("D" if adj == ag else "A")
+        except (ValueError, AttributeError, IndexError):
+            return ""
+
+    def _match_row_items(self, r, i, extra_txt=""):
+        """一场比赛 → 1~2 行（Excel示例格式：上不让球/下让球）"""
         res = r.get("result") or ""
-        return [res] + (["odd"] if i % 2 else [])
+        res_cn = {"H": "胜", "D": "平", "A": "负"}.get(res, res)
+        zebra = ["odd"] if i % 2 else []
+        head = (r["match_date"], f"{r['week']}{r['match_num']}", r["league"],
+                r["home"], r["away"])
+        score = r.get("score", "")
+        items = []
+        # 第一行: 不让球 (让球=0)
+        if r.get("odds_win") not in ("", None) or not r.get("hhad_win"):
+            items.append({"tags": [res] + zebra, "values": head + ("0",
+                self._odds_s(r.get("odds_win")), self._odds_s(r.get("odds_draw")),
+                self._odds_s(r.get("odds_lose")), score, res_cn, extra_txt)})
+        # 第二行: 让球
+        line = r.get("goal_line", "")
+        has_hhad = any(r.get(k) not in ("", None) for k in ("hhad_win", "hhad_draw", "hhad_lose"))
+        if has_hhad:
+            line_s = f"{float(line):+g}" if line not in ("", None) else "-"
+            hres = self._handicap_res(score, line) if line not in ("", None) else ""
+            hres_cn = {"H": "胜", "D": "平", "A": "负"}.get(hres, hres)
+            items.append({"tags": [hres or res] + zebra, "values": ("", "", "", "", "") + (line_s,
+                self._odds_s(r.get("hhad_win")), self._odds_s(r.get("hhad_draw")),
+                self._odds_s(r.get("hhad_lose")), score, hres_cn, "")})
+        if not items:   # 无任何赔率(取消场次等)
+            items.append({"tags": [res] + zebra, "values": head + ("0", "-", "-", "-", score, res_cn, extra_txt)})
+        return items
 
     def _export_stat(self):
         if not self._stat_rows:
