@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "v1.4.2"
+APP_VERSION = "v1.5"
 
 # 数据目录：exe/script 同目录（打包后也可移植）
 if getattr(sys, "frozen", False):          # PyInstaller 打包后
@@ -331,6 +331,9 @@ def fetch_odds_history(match_id):
 def enrich_hhad(progress_cb=None, limit=None):
     """
     补全让球赔率：对库里缺 hhad 的场次逐个调赔率历史接口，取收盘价写入。
+    注意：
+    - 悬殊场次官方只开让球盘（hadList为空），照样补 hhad
+    - UPDATE 只写非空值，绝不冲掉库里已有的赔率
     返回 (成功数, 跳过数, 失败数)
     """
     db_init()
@@ -345,18 +348,29 @@ def enrich_hhad(progress_cb=None, limit=None):
     for i, mid in enumerate(todo, 1):
         try:
             odds = fetch_odds_history(mid)
-            if odds["odds_snapshots"] == 0:
-                skip += 1   # 官方无该场赔率记录（老场次或未开售）
-            elif odds["hhad_win"] != "":
-                with DB_LOCK, db() as conn:
-                    conn.execute(
-                        "UPDATE matches SET odds_win=?, odds_draw=?, odds_lose=?, goal_line=?, "
-                        "hhad_win=?, hhad_draw=?, hhad_lose=? WHERE match_id=?",
-                        (odds["odds_win"], odds["odds_draw"], odds["odds_lose"], odds["goal_line"],
-                         odds["hhad_win"], odds["hhad_draw"], odds["hhad_lose"], mid))
-                ok += 1
+            has_hhad = odds["hhad_win"] != ""
+            has_had = odds["odds_win"] != ""
+            if not has_hhad and not has_had:
+                skip += 1   # 官方完全没有该场赔率记录
             else:
-                skip += 1
+                # 动态拼接: 只更新有值的字段，保留库里已有数据
+                sets, vals = [], []
+                pairs = [("odds_win", odds["odds_win"]), ("odds_draw", odds["odds_draw"]),
+                         ("odds_lose", odds["odds_lose"]), ("goal_line", odds["goal_line"]),
+                         ("hhad_win", odds["hhad_win"]), ("hhad_draw", odds["hhad_draw"]),
+                         ("hhad_lose", odds["hhad_lose"])]
+                for col, v in pairs:
+                    if v != "":
+                        sets.append(f"{col}=?")
+                        vals.append(v)
+                if sets:
+                    vals.append(mid)
+                    with DB_LOCK, db() as conn:
+                        conn.execute(
+                            "UPDATE matches SET " + ",".join(sets) + " WHERE match_id=?", vals)
+                    ok += 1
+                else:
+                    skip += 1
         except Exception:
             fail += 1
             time.sleep(1)
@@ -994,11 +1008,16 @@ class App(tk.Tk):
         chunk = rows[idx * size:(idx + 1) * size]
         self.tv_stat.delete(*self.tv_stat.get_children())
         for r in chunk:
+            # 悬殊场次官方只开让球盘 → 不让球赔率为空, 标注说明
+            if not r.get("odds_win") and r.get("hhad_win"):
+                extra = "仅让球盘"
+            else:
+                extra = r.get("h2h", "")
             self.tv_stat.insert("", "end", tags=(r.get("result") or "",), values=(
                 r["match_date"], f"{r['week']}{r['match_num']}", r["league"], r["home"], r["away"],
                 r["odds_win"], r["odds_draw"], r["odds_lose"], r["goal_line"],
                 r["score"], {"H": "胜", "D": "平", "A": "负"}.get(r.get("result"), r.get("result") or ""),
-                r.get("h2h", "")))
+                extra))
         self.lbl_b_page.config(text=f"第 {idx+1}/{pages} 页　共 {len(rows)} 条　"
                                     f"本页 {len(chunk)} 条（{idx*size+1}-{idx*size+len(chunk)}）")
 
