@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "v1.8"
+APP_VERSION = "v1.9"
 
 # 数据目录：exe/script 同目录（打包后也可移植）
 if getattr(sys, "frozen", False):          # PyInstaller 打包后
@@ -533,55 +533,64 @@ def _dist_stats(rows, side):
     }
 
 
-def stat_normal(ow_t, od_t, ol_t, pct, pool="both", league="", date_from="", date_to=""):
+def stat_normal(ow_rng, od_rng, ol_rng, pool="had", league="", date_from="", date_to=""):
     """
-    常规统计（多赔率可选匹配 + 盘口选择）：
-    输入的赔率项才参与筛选（各自 ±pct% 区间），没输入的跳过。
-    pool: had=不让球 / hhad=让球(赛果按让球后) / both=两个盘口都试，各自计样本
-    返回按日期倒序的场次（带 hit_boards），统计按盘口样本算。
+    常规统计（区间版）：
+    - 每项输入为区间字符串 "2.5-2.59" 或单值 "2.5"（=精确匹配）
+    - 填几项匹配几项：只填胜→只按胜筛；填胜+平→两项都要落在区间
+    - pool: had=不让球盘 / hhad=让球盘（赛果按让球后折算）
     """
+    def _parse(rng):
+        if not rng:
+            return None
+        rng = str(rng).strip().replace("～", "-").replace("~", "-").replace("－", "-").replace(" ", "")
+        if not rng:
+            return None
+        parts = rng.split("-")
+        if len(parts) == 2:
+            return (float(parts[0]), float(parts[1]))
+        return (float(rng), float(rng))
+    try:
+        ranges = [_parse(x) for x in (ow_rng, od_rng, ol_rng)]
+    except ValueError:
+        return None, {"error": "区间格式错误，示例 2.5-2.59 或单值 2.5"}
+    if not any(ranges):
+        return [], {"error": "至少填一项赔率区间"}
+    fields = HAD_FIELDS if pool == "had" else HHAD_FIELDS
+    conds = [(f, lo, hi) for (f, rg) in zip(fields, ranges) if rg for (lo, hi) in [rg]]
     hist = load_history()
-    conds_had, conds_hhad = [], []
-    for target, f_had, f_hhad in ((ow_t, "odds_win", "hhad_win"),
-                                  (od_t, "odds_draw", "hhad_draw"),
-                                  (ol_t, "odds_lose", "hhad_lose")):
-        if target:
-            lo, hi = target * (1 - pct / 100), target * (1 + pct / 100)
-            conds_had.append((f_had, lo, hi))
-            conds_hhad.append((f_hhad, lo, hi))
-    if not conds_had:
-        return [], {"n": 0, "n_samples": 0, "conds": []}
-
-    def _hit(r, conds, fields):
-        for (field, lo, hi), f in zip(conds, fields):
-            v = r.get(field, "")
-            if v == "" or not (lo <= float(v) <= hi):
-                return False
-        return True
-
     out, samples = [], []
     for r in hist:
         if not _base_filters(r, league, date_from, date_to):
             continue
-        hits = []
-        if pool in ("had", "both") and _hit(r, conds_had, HAD_FIELDS):
+        ok = True
+        for f, lo, hi in conds:
+            v = r.get(f, "")
+            if v == "" or not (lo <= float(v) <= hi):
+                ok = False
+                break
+        if not ok:
+            continue
+        if pool == "had":
             res = r.get("result") or ""
-            if res in ("H", "D", "A"):
-                hits.append(("不让球", res))
-        if pool in ("hhad", "both") and _hit(r, conds_hhad, HHAD_FIELDS):
-            hres = handicap_result(r.get("score", ""), r.get("goal_line", ""))
-            if hres:
-                hits.append(("让球", hres))
-        if hits:
-            r2 = dict(r)
-            r2["hit_boards"] = hits
-            out.append(r2)
-            samples.extend(_board_sample(r, b, res) for b, res in hits)
+            if res not in ("H", "D", "A"):
+                continue
+            board = "不让球"
+        else:
+            res = handicap_result(r.get("score", ""), r.get("goal_line", ""))
+            if not res:
+                continue
+            board = "让球"
+        r2 = dict(r)
+        r2["hit_boards"] = [(board, res)]
+        out.append(r2)
+        samples.append(_board_sample(r, board, res))
     out.sort(key=lambda r: r.get("match_date") or "", reverse=True)
     st = _dist_stats(samples, "win")
     st["n_samples"] = len(samples)
-    st["conds"] = [(f.replace("hhad_", "").replace("odds_", ""), round(lo, 2), round(hi))
-                   for f, lo, hi in conds_had]
+    cn = {"odds_win": "胜", "odds_draw": "平", "odds_lose": "负",
+          "hhad_win": "让胜", "hhad_draw": "让平", "hhad_lose": "让负"}
+    st["conds"] = [(cn[f], lo, hi) for f, lo, hi in conds]
     st["pool"] = pool
     return out, st
 
@@ -867,21 +876,23 @@ class App(tk.Tk):
         self.auto_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(bar, text="每5分钟自动刷新", variable=self.auto_var,
                         command=self._toggle_auto).pack(side="left", padx=12)
-        ttk.Label(bar, text="(显示当前在售场次与最新固定奖金；让球列=让球线及让球胜平负赔率)").pack(side="left", padx=8)
+        ttk.Label(bar, text="(每场两行：上=不让球盘，下=让球盘(含让球线)；开赛列显示比赛时间)").pack(side="left", padx=8)
 
-        cols = ("week", "league", "home", "away", "time", "ow", "od", "oa", "line", "hw", "hd", "ha", "single")
-        heads = ("场次", "联赛", "主队", "客队", "开赛", "胜赔", "平赔", "负赔",
-                 "让球线", "让球胜", "让球平", "让球负", "单关")
-        widths = (70, 70, 130, 130, 140, 60, 60, 60, 70, 70, 70, 70, 50)
+        # 与统计明细表同款双行格式: 每场两行(上不让球/下让球)
+        cols = ("week", "league", "home", "away", "time", "line",
+                "ow", "od", "oa", "single")
+        heads = ("场次", "联赛", "主队", "客队", "开赛", "让球",
+                 "胜", "平", "负", "单关")
+        widths = (84, 70, 128, 128, 128, 50, 62, 62, 62, 50)
         wrap = ttk.Frame(tab)
         wrap.pack(fill="both", expand=True, padx=6)
-        self.tv_onsale = ttk.Treeview(wrap, columns=cols, show="headings", height=18)
+        self.tv_onsale = ttk.Treeview(wrap, columns=cols, show="headings", height=16)
         for c, h, w in zip(cols, heads, widths):
             self.tv_onsale.heading(c, text=h)
             self.tv_onsale.column(c, width=w, anchor="center")
         vs = ttk.Scrollbar(wrap, orient="vertical", command=self.tv_onsale.yview)
         self.tv_onsale.configure(yscrollcommand=vs.set)
-        self.tv_onsale.pack(side="left", fill="both", expand=True)
+        self.tv_onsale.pack(side="top", fill="both", expand=True)
         vs.pack(side="right", fill="y")
         self.tv_onsale.tag_configure("odd", background="#f5f7fa")
 
@@ -900,34 +911,29 @@ class App(tk.Tk):
                             command=self._switch_mode).pack(side="left", padx=10)
 
         # ── 常规面板 ──
-        self.fr_normal = ttk.LabelFrame(tab, text="常规统计：填几项赔率就按几项匹配（没填的不参与），区间=各自±浮动%")
+        self.fr_normal = ttk.LabelFrame(tab, text="常规统计：区间查询，填几项匹配几项（如胜 2.5-2.59；填胜+平则两项都要命中）")
         self.fr_normal.pack(fill="x", padx=6, pady=6)
-        ttk.Label(self.fr_normal, text="浮动 ±(%):").grid(row=0, column=0, padx=6, pady=8, sticky="e")
-        self.e_pct = ttk.Entry(self.fr_normal, width=8)
-        self.e_pct.insert(0, "8")
-        self.e_pct.grid(row=0, column=1, padx=4)
-        ttk.Label(self.fr_normal, text="胜赔:").grid(row=0, column=2, padx=(14, 0), sticky="e")
-        self.e_ow = ttk.Entry(self.fr_normal, width=9)
-        self.e_ow.grid(row=0, column=3, padx=4)
-        ttk.Label(self.fr_normal, text="平赔:").grid(row=0, column=4, padx=(10, 0), sticky="e")
-        self.e_od = ttk.Entry(self.fr_normal, width=9)
-        self.e_od.grid(row=0, column=5, padx=4)
-        ttk.Label(self.fr_normal, text="负赔:").grid(row=0, column=6, padx=(10, 0), sticky="e")
-        self.e_ol = ttk.Entry(self.fr_normal, width=9)
-        self.e_ol.grid(row=0, column=7, padx=4)
-        ttk.Label(self.fr_normal, text="(至少填一项)").grid(row=0, column=8, padx=4)
+        ttk.Label(self.fr_normal, text="查询类型:").grid(row=0, column=0, padx=6, pady=8, sticky="e")
+        self.var_pool_n = tk.StringVar(value="had")
+        ttk.Radiobutton(self.fr_normal, text="不让球查询", value="had", variable=self.var_pool_n).grid(row=0, column=1, padx=4)
+        ttk.Radiobutton(self.fr_normal, text="让球查询", value="hhad", variable=self.var_pool_n).grid(row=0, column=2, padx=4)
+        ttk.Label(self.fr_normal, text="(让球查询只匹配让球盘，赛果按让后折算)").grid(row=0, column=3, columnspan=2, padx=4, sticky="w")
 
-        ttk.Label(self.fr_normal, text="盘口:").grid(row=1, column=2, padx=(12, 0), pady=6, sticky="e")
-        self.var_pool_n = tk.StringVar(value="both")
-        pool_box = ttk.Combobox(self.fr_normal, textvariable=self.var_pool_n, width=8, state="readonly",
-                                values=["both", "had", "hhad"])
-        pool_box.grid(row=1, column=3, padx=4)
-        ttk.Label(self.fr_normal, text="(both=两盘都试 had=不让球 hhad=让球,让球按让后赛果)").grid(row=1, column=4, columnspan=3, padx=4, sticky="w")
+        ttk.Label(self.fr_normal, text="胜:").grid(row=1, column=0, padx=6, pady=6, sticky="e")
+        self.e_ow = ttk.Entry(self.fr_normal, width=11)
+        self.e_ow.grid(row=1, column=1, padx=4)
+        ttk.Label(self.fr_normal, text="平:").grid(row=1, column=2, padx=(10, 0), sticky="e")
+        self.e_od = ttk.Entry(self.fr_normal, width=11)
+        self.e_od.grid(row=1, column=3, padx=4)
+        ttk.Label(self.fr_normal, text="负:").grid(row=1, column=4, padx=(10, 0), sticky="e")
+        self.e_ol = ttk.Entry(self.fr_normal, width=11)
+        self.e_ol.grid(row=1, column=5, padx=4)
+        ttk.Label(self.fr_normal, text="(格式 2.5-2.59，至少填一项)").grid(row=1, column=6, columnspan=2, padx=4, sticky="w")
 
-        ttk.Label(self.fr_normal, text="联赛过滤:").grid(row=1, column=0, padx=6, pady=6, sticky="e")
+        ttk.Label(self.fr_normal, text="联赛过滤:").grid(row=2, column=0, padx=6, pady=6, sticky="e")
         self.e_league = ttk.Entry(self.fr_normal, width=10)
-        self.e_league.grid(row=1, column=1, padx=4)
-        self._dates_normal = self._date_row(self.fr_normal, 1, default_from="month")
+        self.e_league.grid(row=2, column=1, padx=4)
+        self._dates_normal = self._date_row(self.fr_normal, 2, default_from="month")
 
         # ── 相似面板 ──
         self.fr_similar = ttk.LabelFrame(tab, text="相似统计：输入一场比赛的胜平负赔率，找历史上最像的场次")
@@ -945,11 +951,11 @@ class App(tk.Tk):
         self.e_s_top = ttk.Entry(self.fr_similar, width=6); self.e_s_top.insert(0, "20")
         self.e_s_top.grid(row=0, column=7, padx=4)
         ttk.Label(self.fr_similar, text="(按相似度排名取前N场)").grid(row=0, column=8, padx=4)
-        ttk.Label(self.fr_similar, text="盘口:").grid(row=1, column=0, padx=6, pady=6, sticky="e")
-        self.var_pool_s = tk.StringVar(value="both")
-        ttk.Combobox(self.fr_similar, textvariable=self.var_pool_s, width=8, state="readonly",
-                     values=["both", "had", "hhad"]).grid(row=1, column=1, padx=4)
-        ttk.Label(self.fr_similar, text="(both=两盘都试 had=不让球 hhad=让球)").grid(row=1, column=2, columnspan=4, padx=4, sticky="w")
+        ttk.Label(self.fr_similar, text="查询类型:").grid(row=1, column=0, padx=6, pady=6, sticky="e")
+        self.var_pool_s = tk.StringVar(value="had")
+        ttk.Radiobutton(self.fr_similar, text="不让球", value="had", variable=self.var_pool_s).grid(row=1, column=1, padx=4)
+        ttk.Radiobutton(self.fr_similar, text="让球", value="hhad", variable=self.var_pool_s).grid(row=1, column=2, padx=4)
+        ttk.Label(self.fr_similar, text="(按所选盘口的赔率算相似，让球盘赛果按让后折算)").grid(row=1, column=3, columnspan=4, padx=4, sticky="w")
         self._dates_similar = self._date_row(self.fr_similar, 1, default_from="month")
 
         # ── 球队面板 ──
@@ -1318,14 +1324,25 @@ class App(tk.Tk):
         self.msgq.put(("local_loaded", (rows, load_history())))
 
     def _fill_onsale(self, rows, from_cache=False):
+        """在售双行展示: 每场 上=不让球盘 / 下=让球盘（含让球线）"""
         self.tv_onsale.delete(*self.tv_onsale.get_children())
         for i, r in enumerate(rows):
-            tag = ("odd",) if i % 2 else ()
-            self.tv_onsale.insert("", "end", tags=tag, values=(
-                f"{r['week']}{r['match_num']}", r["league"], r["home"], r["away"], r["match_time"],
-                r["odds_win"], r["odds_draw"], r["odds_lose"],
-                r["goal_line"], r["hhad_win"], r["hhad_draw"], r["hhad_lose"],
-                "是" if str(r["single"]) in ("1", "True", "true") else ""))
+            zebra = ("odd",) if i % 2 else ()
+            head = (f"{r['week']}{r['match_num']}", r["league"], r["home"], r["away"], r.get("match_time", ""))
+            single = "是" if str(r.get("single", "")) in ("1", "True", "true") else ""
+            # 第一行: 不让球
+            if r.get("odds_win") not in ("", None):
+                self.tv_onsale.insert("", "end", tags=zebra, values=head + ("0",
+                    self._odds_s(r.get("odds_win")), self._odds_s(r.get("odds_draw")),
+                    self._odds_s(r.get("odds_lose")), single))
+            # 第二行: 让球
+            has_hhad = any(r.get(k) not in ("", None) for k in ("hhad_win", "hhad_draw", "hhad_lose"))
+            if has_hhad:
+                line = r.get("goal_line", "")
+                line_s = f"{float(line):+g}" if line not in ("", None) else "-"
+                self.tv_onsale.insert("", "end", tags=zebra, values=("", "", "", "", "") + (line_s,
+                    self._odds_s(r.get("hhad_win")), self._odds_s(r.get("hhad_draw")),
+                    self._odds_s(r.get("hhad_lose")), single))
         tag = "（本地缓存）" if from_cache else ""
         self.lbl_onsale_info.config(text=f"在售 {len(rows)} 场 {tag}　更新时间: "
                                          f"{rows[0]['fetched_at'] if rows else '—'}")
@@ -1354,26 +1371,15 @@ class App(tk.Tk):
             return
         self._set_status("统计中...")
         if mode == "normal":
-            try:
-                pct = float(self.e_pct.get())
-                if pct < 0:
-                    raise ValueError
-                def _f(entry):
-                    t = entry.get().strip()
-                    return float(t) if t else None
-                ow_t, od_t, ol_t = _f(self.e_ow), _f(self.e_od), _f(self.e_ol)
-                if ow_t is not None and ow_t <= 0: raise ValueError
-                if od_t is not None and od_t <= 0: raise ValueError
-                if ol_t is not None and ol_t <= 0: raise ValueError
-                if not any(v is not None for v in (ow_t, od_t, ol_t)):
-                    messagebox.showwarning("输入有误", "至少填一项赔率（胜/平/负任选）")
-                    return
-            except ValueError:
-                messagebox.showwarning("输入有误", "赔率必须是正数，浮动百分比必须≥0")
+            ow_r = self.e_ow.get().strip()
+            od_r = self.e_od.get().strip()
+            ol_r = self.e_ol.get().strip()
+            if not any((ow_r, od_r, ol_r)):
+                messagebox.showwarning("输入有误", "至少填一项赔率区间（如 2.5-2.59）")
                 return
             league = self.e_league.get().strip()
             pool = self.var_pool_n.get()
-            self._bg(lambda: self._task_normal(ow_t, od_t, ol_t, pct, pool, league, df, dt))
+            self._bg(lambda: self._task_normal(ow_r, od_r, ol_r, pool, league, df, dt))
         elif mode == "similar":
             try:
                 ow, od, ol = (float(self.e_s_ow.get()), float(self.e_s_od.get()), float(self.e_s_ol.get()))
@@ -1398,9 +1404,11 @@ class App(tk.Tk):
             finished = self.var_b_finished.get()
             self._bg(lambda: self._task_browse(df, dt, team, league, finished))
 
-    def _task_normal(self, ow_t, od_t, ol_t, pct, pool, league, df, dt):
-        rows, stats = stat_normal(ow_t, od_t, ol_t, pct, pool, league, df, dt)
-        # 推荐基于盘口样本的赛果
+    def _task_normal(self, ow_r, od_r, ol_r, pool, league, df, dt):
+        rows, stats = stat_normal(ow_r, od_r, ol_r, pool, league, df, dt)
+        if stats.get("error"):
+            self.msgq.put(("error", stats["error"]))
+            return
         samples = []
         for r in rows:
             for board, res in r.get("hit_boards", []):
@@ -1409,7 +1417,7 @@ class App(tk.Tk):
                                 "odds_draw": r.get("hhad_draw" if board == "让球" else "odds_draw", ""),
                                 "odds_lose": r.get("hhad_lose" if board == "让球" else "odds_lose", "")})
         rec = recommend_outcome(samples)
-        self.msgq.put(("stat", (rows, stats, "normal", (ow_t, od_t, ol_t, pct, pool, rec))))
+        self.msgq.put(("stat", (rows, stats, "normal", (ow_r, od_r, ol_r, pool, rec))))
         self._set_status("统计完成")
 
     def _task_similar(self, ow, od, ol, topn, pool, df, dt):
@@ -1442,17 +1450,15 @@ class App(tk.Tk):
         self.lbl_stat.config(state="normal")
         self.lbl_stat.delete("1.0", "end")
         if mode == "normal":
-            ow_t, od_t, ol_t, pct, pool, rec = args
-            cn = {"win": "胜赔", "draw": "平赔", "lose": "负赔"}
-            cond_txt = "、".join(f"{cn[f]} {lo}~{hi}" for f, lo, hi in stats.get("conds", []))
-            pool_cn = {"had": "不让球盘", "hhad": "让球盘", "both": "两盘都试"}[pool]
+            ow_r, od_r, ol_r, pool, rec = args
+            cond_txt = "、".join(f"{f} {lo:g}~{hi:g}" for f, lo, hi in stats.get("conds", []))
+            pool_cn = {"had": "不让球", "hhad": "让球"}[pool]
             n_s = stats.get("n_samples", stats["n"])
             self.lbl_stat.insert("end",
-                f"查询条件（浮动±{pct}%，盘口：{pool_cn}）：{cond_txt}　"
-                f"命中 {stats['n']} 场 / {n_s} 个盘口样本\n"
-                f"赛果分布（按盘口口径，让球盘=让球后赛果）：主胜 {stats['win']}({stats['p_win']:.1f}%)   "
-                f"平局 {stats['draw']}({stats['p_draw']:.1f}%)   客胜 {stats['lose']}({stats['p_lose']:.1f}%)　"
-                f"买「胜」ROI {stats['roi']:+.1f}%\n")
+                f"查询（{pool_cn}）：{cond_txt}　命中 {stats['n']} 场\n"
+                f"赛果分布（{'让球盘=让球后赛果' if pool == 'hhad' else '不让球盘'}）："
+                f"主胜 {stats['win']}({stats['p_win']:.1f}%)   平局 {stats['draw']}({stats['p_draw']:.1f}%)   "
+                f"客胜 {stats['lose']}({stats['p_lose']:.1f}%)　买「胜」ROI {stats['roi']:+.1f}%\n")
             if rec:
                 self.lbl_stat.insert("end",
                     f"胜负率推荐（均值回归模型）：✅ 推荐「{rec['pick']}」　"
@@ -1463,9 +1469,9 @@ class App(tk.Tk):
         elif mode == "similar":
             ow, od, ol, topn, pool, rec = args
             tp = stats.get("target_probs", ("?","?","?"))
-            pool_cn = {"had": "不让球盘", "hhad": "让球盘", "both": "两盘都试"}[pool]
+            pool_cn = {"had": "不让球", "hhad": "让球"}[pool]
             self.lbl_stat.insert("end",
-                f"查询条件：赔率 {ow}/{od}/{ol}（隐含概率 胜{tp[0]}% 平{tp[1]}% 负{tp[2]}%，去水；盘口：{pool_cn}）\n"
+                f"查询条件：赔率 {ow}/{od}/{ol}（隐含概率 胜{tp[0]}% 平{tp[1]}% 负{tp[2]}%，去水；{pool_cn}盘）\n"
                 f"取相似度前 {stats.get('n_samples', stats['n'])} 个盘口样本，共 {stats['n']} 场，按日期倒序（相似度见备注）\n"
                 f"赛果分布（让球盘=让球后赛果）：主胜 {stats['win']}({stats['p_win']:.1f}%)   "
                 f"平局 {stats['draw']}({stats['p_draw']:.1f}%)   客胜 {stats['lose']}({stats['p_lose']:.1f}%)\n")
