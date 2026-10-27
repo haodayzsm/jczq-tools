@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-APP_VERSION = "v1.9"
+APP_VERSION = "v1.9.1"
 
 # 数据目录：exe/script 同目录（打包后也可移植）
 if getattr(sys, "frozen", False):          # PyInstaller 打包后
@@ -178,14 +178,43 @@ DB_LOCK = threading.Lock()   # 多线程 GUI 下保护写操作
 def db():
     """获取数据库连接（WAL 模式：并发读写不互塞，断电不烂库）"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # 权限自检：目录/库文件不可写时给出明确指引，而不是憋到SQL层报readonly
+    try:
+        _probe = DATA_DIR / ".write_test"
+        _probe.write_text("ok", encoding="utf-8")
+        _probe.unlink()
+    except PermissionError:
+        raise RuntimeError(
+            f"数据目录不可写：{DATA_DIR}\n"
+            f"请把程序移到普通目录（如 D:\jczq\\ 或桌面）后重试。\n"
+            f"Program Files / 系统盘受保护目录会导致此问题。")
+    except OSError as e:
+        raise RuntimeError(f"数据目录异常 {DATA_DIR}: {e}")
     conn = sqlite3.connect(DB_FILE, timeout=15)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass   # 个别网络盘/旧文件系统不支持WAL, 降级默认journal也能用
     return conn
+
+
+def _startup_db_check():
+    """启动体检：解除库文件的只读属性（从U盘/备份恢复时常带只读位），WAL残留清理"""
+    import os as _os
+    import stat as _stat
+    for f in (DB_FILE, Path(str(DB_FILE) + "-wal"), Path(str(DB_FILE) + "-shm")):
+        if f.exists():
+            try:
+                if not _os.access(f, _os.W_OK):
+                    f.chmod(f.stat().st_mode | _stat.S_IWRITE)
+            except (PermissionError, OSError):
+                pass   # 无法改就留给db()的明确报错
 
 
 def db_init():
     """建表 + 索引 + 旧数据自动迁移（幂等，可反复调用）"""
+    _startup_db_check()
     with DB_LOCK, db() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS matches (
